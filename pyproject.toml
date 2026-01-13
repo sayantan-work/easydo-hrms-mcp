@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easydo-hrms-mcp"
+version = "1.0.0"
+description = "MCP Server for EasyDo HRMS - Natural language queries for HR data"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+easydo-hrms = "mcp_server.server:mcp.run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*"]

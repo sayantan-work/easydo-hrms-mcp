@@ -1,46 +1,110 @@
 # EasyDo HRMS MCP Server - Setup Guide
 
-This MCP server allows you to query EasyDo HRMS data using natural language through Claude Code or Claude Desktop.
+## Quick Setup (Recommended)
 
-## Prerequisites
+1. Clone the repository
+2. Get the `.env` file from your team lead and place it in the project folder
+3. Open Claude Code in this folder
+4. Say: **"Set up this MCP server for me"**
 
-- Python 3.10 or higher
-- Claude Code CLI or Claude Desktop installed
-- Access to EasyDo HRMS (you'll need to login with your phone number)
+Claude will automatically detect your OS and run the appropriate setup script.
 
-## Quick Setup (Let Claude Do It)
+---
 
-Just tell Claude Code:
-> "Read the SETUP.md file in this folder and set up the MCP server for me"
+## Setup Instructions for Claude
 
-Claude will detect your OS and configure everything automatically.
+> **For Claude:** Follow these steps to set up the MCP server.
+
+### Step 1: Detect OS and Run Setup Script
+
+Check the platform and run the appropriate setup script:
+
+**Windows (win32):**
+```powershell
+.\setup.ps1
+```
+
+**macOS/Linux (darwin/linux):**
+```bash
+chmod +x setup.sh && ./setup.sh
+```
+
+### Step 2: Verify .env File
+
+Check if `.env` file exists in the project root. If not, inform the user:
+
+> ".env file is missing. Please get it from your team lead or copy .env.example to .env and fill in the values."
+
+Required variables in `.env`:
+- `N8N_WEBHOOK_PROD`
+- `N8N_WEBHOOK_STAGING`
+- `API_BASE_PROD`
+- `API_BASE_STAGING`
+- `DEVICE_ID`
+- `DEVICE_TYPE`
+
+### Step 3: Restart and Verify
+
+After setup completes:
+1. Tell user to restart Claude Code (or type `/mcp` to reconnect)
+2. Verify `easydo-hrms` appears in the MCP server list
+
+### Step 4: Login
+
+Guide user to login:
+```
+login to prod with <phone-number>
+```
+
+or for staging:
+```
+login to staging with <phone-number>
+```
 
 ---
 
 ## Manual Setup
 
-### Step 1: Install the MCP Server
+If the automated setup doesn't work:
 
-Open a terminal in this folder and run:
+### Windows
 
-```bash
+```powershell
+# Create virtual environment
+python -m venv .venv
+
+# Activate it
+.\.venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
 pip install -e .
 ```
 
-This installs the MCP server and its dependencies.
+### macOS/Linux
 
-### Step 2: Configure Claude Code or Claude Desktop
+```bash
+# Create virtual environment
+python3 -m venv .venv
 
-#### For Claude Code (CLI)
+# Activate it
+source .venv/bin/activate
 
-Create a file named `.mcp.json` in your project folder (or home directory for global access):
+# Install dependencies
+pip install -r requirements.txt
+pip install -e .
+```
+
+### Configure MCP
+
+Create/update `~/.mcp.json` (home directory):
 
 **Windows:**
 ```json
 {
   "mcpServers": {
     "easydo-hrms": {
-      "command": "python",
+      "command": "C:\\path\\to\\easy-do-hrms-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-m", "mcp_server.server"],
       "cwd": "C:\\path\\to\\easy-do-hrms-mcp"
     }
@@ -53,128 +117,28 @@ Create a file named `.mcp.json` in your project folder (or home directory for gl
 {
   "mcpServers": {
     "easydo-hrms": {
-      "command": "python3",
+      "command": "/path/to/easy-do-hrms-mcp/.venv/bin/python",
       "args": ["-m", "mcp_server.server"],
       "cwd": "/path/to/easy-do-hrms-mcp"
     }
   }
 }
 ```
-
-#### For Claude Desktop
-
-Edit the Claude Desktop config file:
-
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Linux:** `~/.config/Claude/claude_desktop_config.json`
-
-Add the MCP server configuration:
-
-**Windows:**
-```json
-{
-  "mcpServers": {
-    "easydo-hrms": {
-      "command": "python",
-      "args": ["-m", "mcp_server.server"],
-      "cwd": "C:\\path\\to\\easy-do-hrms-mcp"
-    }
-  }
-}
-```
-
-**macOS/Linux:**
-```json
-{
-  "mcpServers": {
-    "easydo-hrms": {
-      "command": "python3",
-      "args": ["-m", "mcp_server.server"],
-      "cwd": "/path/to/easy-do-hrms-mcp"
-    }
-  }
-}
-```
-
-### Step 3: Restart Claude
-
-- **Claude Code:** Type `/mcp` to reconnect, or restart the CLI
-- **Claude Desktop:** Quit and reopen the app
-
-### Step 4: Login
-
-Once connected, tell Claude:
-> "Login to EasyDo HRMS with my phone number: XXXXXXXXXX"
-
-You'll receive an OTP to complete the login.
-
----
-
-## Available Commands
-
-Once logged in, you can ask things like:
-
-### Self-Service
-- "What is my salary?"
-- "Show my leave balance"
-- "What is my profile?"
-- "Show my attendance for December 2025"
-
-### For Managers
-- "Who reports to me?"
-- "Show pending approvals"
-- "Who is on leave today?"
-- "Who was late today?"
-
-### HR Queries
-- "Search for employee John"
-- "Get salary details for Rahul"
-- "Show birthdays this month"
-- "List new joiners in January"
-
-### Policies
-- "What is the leave policy?"
-- "Show attendance policy"
-- "Get statutory rules"
-
-### Multi-Company Support
-If you belong to multiple companies:
-- Default queries return your **primary company** data
-- Use `company_name="all"` to see all companies
-- Use `company_name="CompanyName"` for a specific company
-
-Example: "Show my salary for all companies"
 
 ---
 
 ## Troubleshooting
 
-### "Not authenticated" error
-Run the login command with your phone number.
-
-### MCP server not connecting
-1. Check Python is installed: `python --version` or `python3 --version`
-2. Verify the path in your config file is correct
-3. Try running manually: `python -m mcp_server.server`
-
-### "Module not found" error
-Install dependencies: `pip install -e .` in the MCP folder
-
----
-
-## Security Notes
-
-- Your login credentials are stored locally in `~/.easydo/credentials.json`
-- The server only allows SELECT queries (no data modification)
-- RBAC (Role-Based Access Control) is enforced based on your role:
-  - **Super Admin:** Full access to all data
-  - **Company Admin:** Access to their company's data
-  - **Branch Manager:** Access to their branch's data
-  - **Employee:** Access to their own data only
+| Issue | Solution |
+|-------|----------|
+| `.env` file missing | Get it from team lead or copy from `.env.example` |
+| Python not found | Setup script will auto-install Python 3.12 |
+| MCP not showing | Restart Claude Code and type `/mcp` |
+| "Not authenticated" | Run `login to prod with <phone>` |
+| Permission denied (Linux/Mac) | Run `chmod +x setup.sh` first |
 
 ---
 
 ## Support
 
-For issues or questions, contact the EasyDo development team.
+Contact the EasyDo development team for help.

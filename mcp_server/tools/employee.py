@@ -197,3 +197,134 @@ def register(mcp):
 
         rows = fetch_all(sql, [f"%{query}%"])
         return {"count": len(rows), "employees": rows}
+
+    @mcp.tool()
+    def get_document_verification_status(employee_name: str = None, company_name: str = None) -> dict:
+        """
+        Get document verification status for an employee.
+        If employee_name is not provided, returns your own verification status.
+        Use company_name to filter by specific company.
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return {"error": "Not authenticated. Please login first."}
+
+        emp_id, emp_name, comp_name, branch_name, error = _resolve_employee(ctx, employee_name, company_name)
+        if error:
+            return error if isinstance(error, dict) else {"error": error}
+
+        # Get user_id from company_employee
+        query = """
+            SELECT ce.user_id, ce.employee_name, ce.pan_number, ce.aadhar_card_number, ce.uan_number,
+                   u.is_document_verified, u.is_pan_verified, u.is_aadhaar_card_verified,
+                   u.is_uan_number_verified, u.is_face_match_verified, u.is_certificate_verified,
+                   u.is_email_verified
+            FROM company_employee ce
+            LEFT JOIN users u ON u.id = ce.user_id
+            WHERE ce.id = $1
+        """
+        row = fetch_one(query, [emp_id])
+
+        if not row:
+            return {"error": "Employee not found"}
+
+        return {
+            "employee_name": emp_name,
+            "company_name": comp_name,
+            "branch_name": branch_name,
+            "documents": {
+                "pan_number": row.get("pan_number") or None,
+                "aadhar_number": row.get("aadhar_card_number") or None,
+                "uan_number": row.get("uan_number") or None
+            },
+            "verification_status": {
+                "overall": row.get("is_document_verified"),
+                "pan_verified": bool(row.get("is_pan_verified")),
+                "aadhaar_verified": bool(row.get("is_aadhaar_card_verified")),
+                "uan_verified": bool(row.get("is_uan_number_verified")),
+                "face_match_verified": bool(row.get("is_face_match_verified")),
+                "certificate_verified": bool(row.get("is_certificate_verified")),
+                "email_verified": bool(row.get("is_email_verified"))
+            }
+        }
+
+    @mcp.tool()
+    def get_employees(company_name: str = None, branch_name: str = None) -> dict:
+        """
+        Get list of employees for a company/branch.
+        If branch_name is not provided, returns all employees for the company.
+        Defaults to your primary company if no filters provided.
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return {"error": "Not authenticated. Please login first."}
+
+        query = """
+            SELECT ce.employee_name, cb.name as branch_name
+            FROM company_employee ce
+            LEFT JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+        """
+        params = []
+        param_idx = 1
+
+        if company_name:
+            query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+            params.append(f"%{company_name}%")
+            param_idx += 1
+        elif ctx.company_id:
+            # Default to user's company
+            query += f" AND ce.company_id = ${param_idx}"
+            params.append(ctx.company_id)
+            param_idx += 1
+
+        if branch_name:
+            query += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+            params.append(f"%{branch_name}%")
+            param_idx += 1
+
+        query = apply_company_filter(ctx, query, "ce")
+        query += " ORDER BY cb.name, ce.employee_name"
+        rows = fetch_all(query, params) if params else fetch_all(query)
+
+        # Group employees by branch
+        branches = {}
+        for row in rows:
+            branch = row.get("branch_name") or "Unknown"
+            if branch not in branches:
+                branches[branch] = []
+            branches[branch].append(row["employee_name"])
+
+        result = {"count": len(rows), "branches": branches}
+        if company_name:
+            result["company_filter"] = company_name
+        if branch_name:
+            result["branch_filter"] = branch_name
+
+        return result
+
+    @mcp.tool()
+    def search_company(query: str) -> dict:
+        """
+        Search for companies by name.
+        Returns company details including branches count.
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return {"error": "Not authenticated. Please login first."}
+
+        # Simple query first
+        sql = "SELECT id, name as company_name FROM company WHERE status = 1 AND LOWER(name) LIKE LOWER($1) ORDER BY name LIMIT 20"
+        rows = fetch_all(sql, [f"%{query}%"])
+
+        # Get counts for each company
+        for row in rows:
+            branch_sql = "SELECT COUNT(*) as count FROM company_branch WHERE company_id = $1 AND status = 1"
+            emp_sql = "SELECT COUNT(*) as count FROM company_employee WHERE company_id = $1 AND is_deleted = '0' AND employee_status = 3"
+            branch_count = fetch_one(branch_sql, [row["id"]])
+            emp_count = fetch_one(emp_sql, [row["id"]])
+            row["branch_count"] = branch_count["count"] if branch_count else 0
+            row["employee_count"] = emp_count["count"] if emp_count else 0
+
+        return {"count": len(rows), "companies": rows}

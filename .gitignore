@@ -39,7 +39,9 @@ Thumbs.db
 
 # Local credentials (DO NOT COMMIT)
 credentials.json
-
+.env
+CLAUDE.md
+.claude/
 tmpclaude-*
 
 nul

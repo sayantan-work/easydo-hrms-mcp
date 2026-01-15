@@ -1,8 +1,40 @@
 """Database connection via n8n webhook."""
+import os
+import json
 import requests
 from typing import Any
+from dotenv import load_dotenv
 
-N8N_WEBHOOK_URL = "https://n8n.easydoochat.com/webhook/d6ff802e-055b-4ec9-8e6b-bf4f9cd8a5b7"
+# Load environment variables from .env file
+load_dotenv()
+
+# Environment-specific webhook URLs (from .env)
+WEBHOOKS = {
+    "prod": os.getenv("N8N_WEBHOOK_PROD"),
+    "staging": os.getenv("N8N_WEBHOOK_STAGING")
+}
+
+# Default environment
+DEFAULT_ENV = "prod"
+
+
+def get_current_environment() -> str:
+    """Get the current environment from credentials file."""
+    cred_file = os.path.expanduser("~/.easydo/credentials.json")
+    if os.path.exists(cred_file):
+        try:
+            with open(cred_file, "r") as f:
+                creds = json.load(f)
+                return creds.get("environment", DEFAULT_ENV)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return DEFAULT_ENV
+
+
+def get_webhook_url() -> str:
+    """Get the webhook URL for current environment."""
+    env = get_current_environment()
+    return WEBHOOKS.get(env, WEBHOOKS[DEFAULT_ENV])
 
 
 def execute_query(query: str, params: list = None) -> dict[str, Any]:
@@ -20,8 +52,9 @@ def execute_query(query: str, params: list = None) -> dict[str, Any]:
         params = []
 
     try:
+        webhook_url = get_webhook_url()
         response = requests.post(
-            N8N_WEBHOOK_URL,
+            webhook_url,
             json={"query": query, "params": params},
             headers={"Content-Type": "application/json"},
             timeout=30

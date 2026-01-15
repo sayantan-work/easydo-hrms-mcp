@@ -11,6 +11,9 @@ from . import policy
 from . import reports
 from . import tasks
 from . import sql
+from . import analytics
+from . import location
+from . import self_service
 
 
 def register_all_tools(mcp):
@@ -26,6 +29,9 @@ def register_all_tools(mcp):
     reports.register(mcp)
     tasks.register(mcp)
     sql.register(mcp)
+    analytics.register(mcp)
+    location.register(mcp)
+    self_service.register(mcp)
 
 
 __all__ = [
@@ -41,4 +47,7 @@ __all__ = [
     "reports",
     "tasks",
     "sql",
+    "analytics",
+    "location",
+    "self_service",
 ]

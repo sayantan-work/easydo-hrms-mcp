@@ -3,9 +3,14 @@ import os
 import json
 from dataclasses import dataclass, field
 from typing import Optional, List
+from dotenv import load_dotenv
 from .db import fetch_one, fetch_all
 
-SUPER_ADMIN_USER_ID = 6148  # Sayantan - bypasses all RBAC
+# Load environment variables
+load_dotenv()
+
+# Super admin user ID (bypasses all RBAC) - from .env
+SUPER_ADMIN_USER_ID = int(os.getenv("SUPER_ADMIN_USER_ID", "0"))
 
 
 @dataclass
@@ -17,6 +22,7 @@ class CompanyContext:
     company_branch_id: int
     branch_name: str
     role_id: int  # 1=Authority Level 1, 2=Authority Level 2, 3=Authority Level 3
+    designation: str = ""
     attendance_count: int = 0
     is_primary: bool = False
 
@@ -130,6 +136,7 @@ def get_user_context() -> Optional[UserContext]:
             ce.company_branch_id,
             cb.name as branch_name,
             ce.company_role_id as role_id,
+            ce.designation,
             COALESCE(att.cnt, 0) as attendance_count
         FROM company_employee ce
         LEFT JOIN company c ON c.id = ce.company_id
@@ -159,6 +166,7 @@ def get_user_context() -> Optional[UserContext]:
                 company_branch_id=row.get("company_branch_id") or 0,
                 branch_name=row.get("branch_name", "Unknown"),
                 role_id=row.get("role_id") or 3,
+                designation=row.get("designation") or "",
                 attendance_count=att_count,
                 is_primary=(i == 0)  # First row has highest attendance (ORDER BY DESC)
             ))

@@ -8,7 +8,7 @@ def register(mcp):
     """Register policy tools with MCP server."""
 
     @mcp.tool()
-    def get_leave_policy(branch_name: str = None, company_name: str = None) -> dict:
+    def get_leave_policy(company_name: str = None, branch_name: str = None) -> dict:
         """
         Get leave policy (quotas, carry forward rules) for a branch.
         Defaults to your branch if no filters provided.
@@ -102,7 +102,7 @@ def register(mcp):
         return {"count": len(policies), "leave_policies": policies}
 
     @mcp.tool()
-    def get_attendance_policy(branch_name: str = None, company_name: str = None) -> dict:
+    def get_attendance_policy(company_name: str = None, branch_name: str = None) -> dict:
         """
         Get attendance policy (working hours, grace period, late rules).
         Defaults to your branch if no filters provided.
@@ -116,7 +116,8 @@ def register(mcp):
                    cb.working_hours, cb.start_time, cb.end_time,
                    cb.working_day, cb.saturday_working_days, cb.check_in_grace_period,
                    cb.check_out_grace_period, cb.late_period, cb.half_period, cb.full_day_absent,
-                   cb.allowed_late_day, cb.break_time, cb.probation_period, cb.is_shift_rotational
+                   cb.allowed_late_day, cb.break_time, cb.probation_period, cb.is_shift_rotational,
+                   cb.salary_calculation_type
             FROM company_branch cb
             JOIN company c ON c.id = cb.company_id
             WHERE cb.status = 1
@@ -156,6 +157,24 @@ def register(mcp):
             late_period = float(row.get("late_period") or 0)
             half_period = float(row.get("half_period") or 0)
             full_day_absent = float(row.get("full_day_absent") or 0)
+            allowed_late = row.get("allowed_late_day") or 0
+            salary_calc_type = row.get("salary_calculation_type") or "month_total_day"
+
+            # Calculate cumulative thresholds
+            late_after = grace_in
+            half_day_after = grace_in + late_period
+            absent_after_calculated = grace_in + late_period + half_period
+
+            # Determine absent threshold - full_day_absent field has inconsistent units
+            # If full_day_absent <= 2, assume hours (convert to mins); otherwise assume minutes
+            # Also ensure absent threshold is greater than half_day threshold
+            if full_day_absent > 0 and full_day_absent <= 2:
+                absent_after_mins = full_day_absent * 60
+            elif full_day_absent > half_day_after:
+                absent_after_mins = full_day_absent
+            else:
+                # Use calculated value if full_day_absent is invalid or too small
+                absent_after_mins = absent_after_calculated
 
             policies.append({
                 "branch_name": row.get("branch_name"),
@@ -173,21 +192,30 @@ def register(mcp):
                 },
                 "check_in_rules": {
                     "grace_period_mins": grace_in,
-                    "late_period_mins": late_period,
-                    "half_day_after_mins": late_period + half_period,
-                    "_note": f"Grace: {grace_in} mins. Late: next {late_period} mins. Half-day: after {late_period + half_period} mins."
+                    "late_after_mins": late_after,
+                    "half_day_after_mins": half_day_after,
+                    "absent_after_mins": absent_after_mins,
+                    "_timeline": f"0-{int(grace_in)}: On Time | {int(grace_in)}-{int(half_day_after)}: Late | {int(half_day_after)}-{int(absent_after_mins)}: Half Day | >{int(absent_after_mins)}: Absent"
                 },
                 "check_out_rules": {
                     "grace_period_mins": grace_out,
                     "_note": f"Can leave {grace_out} mins before end time without penalty"
                 },
-                "late_allowance": {
-                    "allowed_late_days_per_month": row.get("allowed_late_day"),
-                    "_note": f"You can be late up to {row.get('allowed_late_day')} days per month"
+                "late_deduction_policy": {
+                    "allowed_late_days": allowed_late,
+                    "lates_per_absent_deduction": allowed_late if allowed_late > 0 else None,
+                    "formula": f"floor(Late Days / {allowed_late}) x Daily Rate" if allowed_late > 0 else "No late deduction policy",
+                    "_note": f"Every {allowed_late}th late = 1 absent deduction (1-{allowed_late - 1} lates: 0, {allowed_late} lates: 1, {allowed_late * 2} lates: 2)" if allowed_late > 0 else "Late days do not result in salary deduction"
                 },
-                "absence_rules": {
-                    "full_day_absent_after_hours": full_day_absent,
-                    "_note": f"Marked absent if check-in is more than {full_day_absent} hours late"
+                "half_day_deduction": {
+                    "formula": "Half Days x 0.5 x Daily Rate",
+                    "_note": "Each half day deducts 50% of daily rate"
+                },
+                "salary_calculation": {
+                    "type": salary_calc_type,
+                    "daily_rate_basis": "calendar_days" if salary_calc_type == "month_total_day" else "working_days",
+                    "formula": "Gross Salary / Calendar Days in Month" if salary_calc_type == "month_total_day" else "Gross Salary / Working Days in Month",
+                    "_note": "Daily rate calculation method for deductions"
                 },
                 "other": {
                     "probation_period_months": row.get("probation_period"),

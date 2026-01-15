@@ -51,11 +51,12 @@ def register(mcp):
         return result
 
     @mcp.tool()
-    def get_holidays(year: int = None, branch_name: str = None, company_name: str = None) -> dict:
+    def get_holidays(year: int = None, month: int = None, company_name: str = None, branch_name: str = None) -> dict:
         """
         Get holiday calendar.
         Year defaults to current year.
-        Use branch_name and/or company_name to filter.
+        Month (1-12) is optional - if provided, filters holidays for that month only.
+        Use company_name and/or branch_name to filter.
         """
         ctx = get_user_context()
         if not ctx:
@@ -73,6 +74,11 @@ def register(mcp):
         """
         params = [year]
         param_idx = 2
+
+        if month:
+            query += f" AND EXTRACT(MONTH FROM ch.date::date) = ${param_idx}"
+            params.append(month)
+            param_idx += 1
 
         if company_name:
             query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
@@ -93,6 +99,8 @@ def register(mcp):
         rows = fetch_all(query, params)
 
         result = {"year": year, "count": len(rows), "holidays": rows}
+        if month:
+            result["month"] = month
         if company_name:
             result["company_filter"] = company_name
         if branch_name:

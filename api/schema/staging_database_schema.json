@@ -1,4 +1,9 @@
 {
+  "_metadata": {
+    "environment": "staging",
+    "generated_at": "2026-01-15T16:48:11.822772",
+    "table_count": 144
+  },
   "abuse_report": {
     "columns": [
       {
@@ -4766,66 +4771,6 @@
       }
     ]
   },
-  "clear_chat": {
-    "columns": [
-      {
-        "name": "id",
-        "type": "integer",
-        "nullable": false,
-        "default": "nextval('clear_chat_id_seq'::regclass)",
-        "max_length": null
-      },
-      {
-        "name": "from_user_id",
-        "type": "integer",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "chat_id",
-        "type": "integer",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "created_by",
-        "type": "integer",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "created_date",
-        "type": "timestamp without time zone",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "updated_by",
-        "type": "integer",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "updated_date",
-        "type": "timestamp without time zone",
-        "nullable": true,
-        "default": null,
-        "max_length": null
-      },
-      {
-        "name": "ip_address",
-        "type": "character varying",
-        "nullable": true,
-        "default": null,
-        "max_length": 255
-      }
-    ]
-  },
   "cloud_drive": {
     "columns": [
       {
@@ -7883,27 +7828,27 @@
         "name": "id",
         "type": "integer",
         "nullable": false,
-        "default": null,
+        "default": "nextval('company_employee_leave_id_seq'::regclass)",
         "max_length": null
       },
       {
         "name": "company_id",
         "type": "integer",
         "nullable": true,
-        "default": null,
+        "default": "0",
         "max_length": null
       },
       {
         "name": "company_leave_id",
         "type": "integer",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "company_branch_id",
         "type": "integer",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
@@ -7917,56 +7862,56 @@
       {
         "name": "earned_leave",
         "type": "double precision",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "casual_leave",
         "type": "double precision",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "sick_leave",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "other_leave",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "sick_leave_max_month",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "casual_leave_max_month",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "max_consequently_casual_leave",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "other_leave_max_month",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
@@ -7980,56 +7925,56 @@
       {
         "name": "earned_leave_max_month",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "paid_leave_year",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "carry_forward_leave",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "earned_carry_forward_leaves_last_year",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "is_carry_forward_leave_allowed",
         "type": "integer",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "holiday",
         "type": "real",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
       {
         "name": "year",
         "type": "character varying",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": 255
       },
       {
         "name": "is_current",
         "type": "integer",
-        "nullable": true,
+        "nullable": false,
         "default": null,
         "max_length": null
       },
@@ -8050,8 +7995,8 @@
       {
         "name": "earn_opening_leave",
         "type": "numeric",
-        "nullable": true,
-        "default": null,
+        "nullable": false,
+        "default": "'0'::numeric",
         "max_length": null
       }
     ]

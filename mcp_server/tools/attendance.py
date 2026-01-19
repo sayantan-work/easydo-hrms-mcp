@@ -223,11 +223,12 @@ def register(mcp):
         return result
 
     @mcp.tool()
-    def get_attendance(employee_name: str = None, month: str = None, company_name: str = None) -> dict:
+    def get_attendance(employee_name: str = None, month: str = None, company_name: str = None, detailed: bool = False) -> dict:
         """
-        Get monthly attendance summary.
+        Get monthly attendance summary for an employee.
         If employee_name is not provided, returns your own attendance.
         Month format: YYYY-MM (defaults to current month).
+        Set detailed=True to include day-by-day breakdown with check-in/out times.
         """
         ctx = get_user_context()
         if not ctx:
@@ -236,17 +237,27 @@ def register(mcp):
         if not month:
             month = datetime.now().strftime("%Y-%m")
 
+        # Validate month format
+        try:
+            year, mon = map(int, month.split('-'))
+            if mon < 1 or mon > 12:
+                return {"error": f"Invalid month: {month}. Use YYYY-MM format."}
+        except:
+            return {"error": f"Invalid month format: {month}. Use YYYY-MM format."}
+
+        # Resolve employee
         if employee_name:
-            # Search for the employee
             emp_query = """
-                SELECT ce.id, ce.employee_name, c.name as company_name, cb.name as branch_name
+                SELECT ce.id, ce.employee_name, ce.working_day as emp_working_day,
+                       ce.date_of_joining,
+                       c.name as company_name, cb.name as branch_name,
+                       cb.id as branch_id, cb.working_day as branch_working_day
                 FROM company_employee ce
                 JOIN company c ON c.id = ce.company_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
                 WHERE LOWER(ce.employee_name) LIKE LOWER($1) AND ce.is_deleted = '0'
             """
             params = [f"%{employee_name}%"]
-
             if company_name:
                 emp_query += " AND LOWER(c.name) LIKE LOWER($2)"
                 params.append(f"%{company_name}%")
@@ -266,8 +277,10 @@ def register(mcp):
             target_name = emp_rows[0]["employee_name"]
             target_company = emp_rows[0]["company_name"]
             target_branch = emp_rows[0]["branch_name"]
+            target_branch_id = emp_rows[0]["branch_id"]
+            working_day_config = emp_rows[0].get("emp_working_day") or emp_rows[0].get("branch_working_day")
+            doj_raw = emp_rows[0].get("date_of_joining")
         else:
-            # Default to self
             pc = ctx.primary_company
             if not pc:
                 return {"error": "No company association found."}
@@ -275,116 +288,284 @@ def register(mcp):
             target_name = ctx.user_name
             target_company = pc.company_name
             target_branch = pc.branch_name
+            target_branch_id = pc.company_branch_id
 
-        # Aggregate daily attendance records for the month
-        # Using company_attendance table (detailed daily records)
-        query = """
-            SELECT
-                COUNT(DISTINCT ca.date) as present_days,
-                SUM(CASE WHEN ca.is_late = 1 THEN 1 ELSE 0 END) as late_days,
-                SUM(CASE WHEN ca.is_half_day = 1 THEN 1 ELSE 0 END) as half_days,
-                COALESCE(SUM(ca.total_minutes), 0) as total_minutes
-            FROM company_attendance ca
-            WHERE ca.company_employee_id = $1
-              AND TO_CHAR(ca.date, 'YYYY-MM') = $2
-        """
-        row = fetch_one(query, [target_emp_id, month])
+            # Get working day config and DOJ for self
+            config_query = """
+                SELECT ce.working_day as emp_working_day, cb.working_day as branch_working_day,
+                       ce.date_of_joining
+                FROM company_employee ce
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.id = $1
+            """
+            config_row = fetch_one(config_query, [target_emp_id])
+            working_day_config = config_row.get("emp_working_day") or config_row.get("branch_working_day") if config_row else None
+            doj_raw = config_row.get("date_of_joining") if config_row else None
 
-        # Get leave days for the month
-        leave_query = """
-            SELECT COUNT(*) as leave_days
-            FROM company_approval cap
-            WHERE cap.company_employee_id = $1
-              AND cap.media_type = 'leave'
-              AND cap.status = 'approved'
-              AND (
-                  TO_CHAR(cap.start_date, 'YYYY-MM') = $2
-                  OR TO_CHAR(cap.end_date, 'YYYY-MM') = $2
-              )
-        """
-        leave_row = fetch_one(leave_query, [target_emp_id, month])
+        # Parse DOJ
+        doj_date = None
+        if doj_raw:
+            if isinstance(doj_raw, str):
+                doj_date = datetime.strptime(doj_raw.split('T')[0], "%Y-%m-%d").date()
+            elif hasattr(doj_raw, 'date'):
+                doj_date = doj_raw.date() if hasattr(doj_raw, 'date') else doj_raw
+            elif hasattr(doj_raw, 'year'):
+                from datetime import date
+                doj_date = date(doj_raw.year, doj_raw.month, doj_raw.day)
 
-        present_days = int(row.get("present_days") or 0) if row else 0
-        late_days = int(row.get("late_days") or 0) if row else 0
-        half_days = int(row.get("half_days") or 0) if row else 0
-        total_minutes = float(row.get("total_minutes") or 0) if row else 0
-        leave_days = int(leave_row.get("leave_days") or 0) if leave_row else 0
-
-        # Calculate total hours
-        total_hours = round(total_minutes / 60, 1)
-
-        # Get branch working days configuration
-        branch_query = """
-            SELECT cb.working_day
-            FROM company_branch cb
-            JOIN company_employee ce ON ce.company_branch_id = cb.id
-            WHERE ce.id = $1
-        """
-        branch_row = fetch_one(branch_query, [target_emp_id])
-
-        # Parse working days config (e.g., "mon,tue,wed,thu,fri,sat")
+        # Parse working days config
         day_map = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
-        if branch_row and branch_row.get('working_day'):
-            working_day_config = [day_map[d.strip().lower()] for d in branch_row['working_day'].split(',') if d.strip().lower() in day_map]
+        reverse_day_map = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
+
+        if working_day_config:
+            working_days_set = set()
+            for d in working_day_config.split(','):
+                d_lower = d.strip().lower()
+                if d_lower in day_map:
+                    working_days_set.add(day_map[d_lower])
         else:
-            working_day_config = [0, 1, 2, 3, 4]  # Default Mon-Fri
+            working_days_set = {0, 1, 2, 3, 4}  # Default Mon-Fri
 
         # Get holidays for the month
-        year, mon = map(int, month.split('-'))
         holiday_query = """
-            SELECT date FROM company_holiday
-            WHERE company_branch_id = (SELECT company_branch_id FROM company_employee WHERE id = $1)
-              AND TO_CHAR(date, 'YYYY-MM') = $2
+            SELECT date, name FROM company_holiday
+            WHERE company_branch_id = $1 AND TO_CHAR(date, 'YYYY-MM') = $2
         """
-        holiday_rows = fetch_all(holiday_query, [target_emp_id, month])
-        holidays = set()
+        holiday_rows = fetch_all(holiday_query, [target_branch_id, month])
+        holidays = {}
         if holiday_rows:
             for hr in holiday_rows:
-                if hr.get('date'):
-                    hdate = hr['date']
-                    if hasattr(hdate, 'day'):
-                        holidays.add(hdate.day)
-                    elif isinstance(hdate, str):
-                        # Handle ISO format like "2026-01-14T00:00:00.000Z"
-                        date_part = hdate.split('T')[0]  # Get "2026-01-14"
-                        holidays.add(int(date_part.split('-')[2]))
+                hdate = hr.get('date')
+                if hdate:
+                    if isinstance(hdate, str):
+                        date_part = hdate.split('T')[0]
+                        day_num = int(date_part.split('-')[2])
+                    elif hasattr(hdate, 'day'):
+                        day_num = hdate.day
+                    else:
+                        continue
+                    holidays[day_num] = hr.get('name', 'Holiday')
 
+        # Get attendance records from company_attendance (aggregated by day)
+        attendance_query = """
+            SELECT date,
+                   MAX(CASE WHEN is_late = 1 THEN 1 ELSE 0 END) as is_late,
+                   MAX(CASE WHEN is_half_day = 1 THEN 1 ELSE 0 END) as is_half_day,
+                   SUM(COALESCE(total_minutes, 0)) as total_minutes,
+                   MIN(check_in_time) as first_check_in,
+                   MAX(CASE WHEN check_out_time IS NOT NULL AND check_out_time != 0
+                       THEN check_out_time ELSE NULL END) as last_check_out,
+                   (SELECT ca2.check_in_location_name FROM company_attendance ca2
+                    WHERE ca2.company_employee_id = ca.company_employee_id AND ca2.date = ca.date
+                    ORDER BY ca2.check_in_time ASC LIMIT 1) as check_in_location_name
+            FROM company_attendance ca
+            WHERE ca.company_employee_id = $1 AND TO_CHAR(ca.date, 'YYYY-MM') = $2
+            GROUP BY ca.company_employee_id, ca.date
+            ORDER BY date
+        """
+        attendance_rows = fetch_all(attendance_query, [target_emp_id, month])
+
+        # Build attendance lookup by day
+        attendance_by_day = {}
+        for ar in attendance_rows:
+            adate = ar.get('date')
+            if adate:
+                if isinstance(adate, str):
+                    date_part = adate.split('T')[0]
+                    day_num = int(date_part.split('-')[2])
+                elif hasattr(adate, 'day'):
+                    day_num = adate.day
+                else:
+                    continue
+                # Map to expected field names
+                ar['check_in_time'] = ar.get('first_check_in')
+                ar['check_out_time'] = ar.get('last_check_out')
+                ar['is_present'] = 1
+                attendance_by_day[day_num] = ar
+
+        # Get approved leaves for the month
+        leave_query = """
+            SELECT start_date, end_date, title as leave_type
+            FROM company_approval
+            WHERE company_employee_id = $1
+              AND media_type = 'LEAVE_APPROVAL'
+              AND UPPER(status) = 'APPROVED'
+              AND (TO_CHAR(start_date, 'YYYY-MM') = $2 OR TO_CHAR(end_date, 'YYYY-MM') = $2)
+        """
+        leave_rows = fetch_all(leave_query, [target_emp_id, month])
+
+        # Build leave days lookup
+        leave_days = {}
+        for lr in leave_rows:
+            start = lr.get('start_date')
+            end = lr.get('end_date')
+            leave_type = lr.get('leave_type', 'Leave')
+            if start:
+                if isinstance(start, str):
+                    start = datetime.strptime(start.split('T')[0], "%Y-%m-%d")
+                if end:
+                    if isinstance(end, str):
+                        end = datetime.strptime(end.split('T')[0], "%Y-%m-%d")
+                else:
+                    end = start
+                current = start
+                while current <= end:
+                    if current.year == year and current.month == mon:
+                        leave_days[current.day] = leave_type
+                    current += timedelta(days=1)
+
+        # Build day-by-day attendance list
         today = datetime.now()
-
-        # If current month, count only up to today
         if year == today.year and mon == today.month:
             last_day = today.day
         else:
             last_day = calendar.monthrange(year, mon)[1]
 
-        # Count working days based on branch config, excluding holidays
-        working_days = 0
+        days = []
+        summary = {
+            "total_days": last_day,
+            "working_days": 0,
+            "present": 0,
+            "absent": 0,
+            "late": 0,
+            "half_day": 0,
+            "leave": 0,
+            "holiday": 0,
+            "week_off": 0,
+            "before_doj": 0
+        }
+
+        ist_offset = timedelta(hours=5, minutes=30)
+
         for day in range(1, last_day + 1):
-            if day in holidays:
-                continue
             weekday = calendar.weekday(year, mon, day)
-            if weekday in working_day_config:
-                working_days += 1
+            day_name = reverse_day_map[weekday]
+            date_str = f"{year}-{mon:02d}-{day:02d}"
+
+            day_info = {
+                "date": date_str,
+                "day": day_name,
+                "status": None,
+                "check_in": None,
+                "check_out": None,
+                "hours_worked": None,
+                "is_late": False,
+                "is_half_day": False,
+                "location": None,
+                "note": None
+            }
+
+            # Check if date is before DOJ - skip these days
+            from datetime import date
+            current_date = date(year, mon, day)
+            if doj_date and current_date < doj_date:
+                day_info["status"] = "before_doj"
+                day_info["note"] = "Before date of joining"
+                summary["before_doj"] += 1
+                days.append(day_info)
+                continue
+
+            # Determine status
+            if day in holidays:
+                day_info["status"] = "holiday"
+                day_info["note"] = holidays[day]
+                summary["holiday"] += 1
+            elif weekday not in working_days_set:
+                day_info["status"] = "week_off"
+                summary["week_off"] += 1
+            elif day in leave_days:
+                day_info["status"] = "leave"
+                day_info["note"] = leave_days[day]
+                summary["leave"] += 1
+                summary["working_days"] += 1
+            elif day in attendance_by_day:
+                ar = attendance_by_day[day]
+                day_info["status"] = "present"
+                day_info["is_late"] = ar.get("is_late") == 1
+                day_info["is_half_day"] = ar.get("is_half_day") == 1
+                day_info["location"] = ar.get("check_in_location_name")
+
+                # Convert timestamps
+                check_in_ts = ar.get("check_in_time")
+                check_out_ts = ar.get("check_out_time")
+
+                if check_in_ts and check_in_ts != "0" and check_in_ts != 0:
+                    if isinstance(check_in_ts, str):
+                        check_in_ts = int(check_in_ts)
+                    check_in_dt = datetime.fromtimestamp(check_in_ts / 1000, tz=timezone.utc) + ist_offset
+                    day_info["check_in"] = check_in_dt.strftime("%I:%M %p")
+
+                if check_out_ts and check_out_ts != 0 and check_out_ts != "0":
+                    if isinstance(check_out_ts, str):
+                        check_out_ts = int(check_out_ts)
+                    check_out_dt = datetime.fromtimestamp(check_out_ts / 1000, tz=timezone.utc) + ist_offset
+                    day_info["check_out"] = check_out_dt.strftime("%I:%M %p")
+
+                total_mins = ar.get("total_minutes") or 0
+
+                # For today, check if still working and add ongoing session time
+                is_today = (year == today.year and mon == today.month and day == today.day)
+                if is_today:
+                    # Get the last punch to check if still checked in
+                    last_punch_query = """
+                        SELECT check_in_time, check_out_time
+                        FROM company_attendance
+                        WHERE company_employee_id = $1 AND date = $2
+                        ORDER BY check_in_time DESC LIMIT 1
+                    """
+                    last_punch = fetch_one(last_punch_query, [target_emp_id, date_str])
+                    if last_punch:
+                        last_checkout = last_punch.get("check_out_time")
+                        if not last_checkout or last_checkout == 0 or last_checkout == "0":
+                            # Still checked in - calculate ongoing session
+                            last_checkin_ts = last_punch.get("check_in_time")
+                            if last_checkin_ts:
+                                if isinstance(last_checkin_ts, str):
+                                    last_checkin_ts = int(last_checkin_ts)
+                                now_utc = datetime.now(timezone.utc)
+                                last_checkin_dt = datetime.fromtimestamp(last_checkin_ts / 1000, tz=timezone.utc)
+                                ongoing_mins = (now_utc - last_checkin_dt).total_seconds() / 60
+                                total_mins += ongoing_mins
+                                day_info["check_out"] = "(working)"
+
+                hours = int(total_mins // 60)
+                mins = int(total_mins % 60)
+                day_info["hours_worked"] = f"{hours}h {mins}m"
+
+                summary["present"] += 1
+                summary["working_days"] += 1
+                if day_info["is_late"]:
+                    summary["late"] += 1
+                if day_info["is_half_day"]:
+                    summary["half_day"] += 1
+            else:
+                day_info["status"] = "absent"
+                summary["absent"] += 1
+                summary["working_days"] += 1
+
+            days.append(day_info)
 
         # Calculate attendance percentage
-        attendance_pct = round((present_days / working_days * 100), 1) if working_days > 0 else 0
+        if summary["working_days"] > 0:
+            summary["attendance_percentage"] = round(
+                (summary["present"] / summary["working_days"]) * 100, 1
+            )
+        else:
+            summary["attendance_percentage"] = 0
 
-        return {
+        result = {
             "employee_name": target_name,
-            "month": month,
             "company_name": target_company,
             "branch_name": target_branch,
-            "summary": {
-                "working_days": working_days,
-                "present_days": present_days,
-                "late_days": late_days,
-                "half_days": half_days,
-                "leave_days": leave_days,
-                "total_hours_worked": total_hours,
-                "attendance_percentage": min(attendance_pct, 100)
-            },
-            "_note": f"Attendance % = present_days ({present_days}) / working_days ({working_days}) * 100"
+            "month": month,
+            "date_of_joining": str(doj_date) if doj_date else None,
+            "summary": summary
         }
+
+        if detailed:
+            result["days"] = days
+
+        return result
 
     @mcp.tool()
     def who_is_late_today(company_name: str = None, branch_name: str = None) -> dict:

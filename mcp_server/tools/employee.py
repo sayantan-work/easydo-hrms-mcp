@@ -1,7 +1,20 @@
 """Employee tools for MCP server."""
+import calendar
+from datetime import datetime, date
 from ..auth import get_user_context
 from ..db import fetch_all, fetch_one
 from ..rbac import apply_company_filter, filter_sensitive_fields
+
+
+def _add_months(source_date, months):
+    """Add months to a date, handling year/month overflow."""
+    month = source_date.month - 1 + months
+    year = source_date.year + month // 12
+    month = month % 12 + 1
+    # Handle day overflow (e.g., Jan 31 + 1 month = Feb 28)
+    max_day = calendar.monthrange(year, month)[1]
+    day = min(source_date.day, max_day)
+    return date(year, month, day)
 
 
 def _resolve_employee(ctx, employee_name: str = None, company_name: str = None):
@@ -328,3 +341,115 @@ def register(mcp):
             row["employee_count"] = emp_count["count"] if emp_count else 0
 
         return {"count": len(rows), "companies": rows}
+
+    @mcp.tool()
+    def get_employees_in_probation(company_name: str = None, branch_name: str = None, include_overdue: bool = True) -> dict:
+        """
+        Get employees who are currently in probation period.
+        Shows probation end date and flags overdue probations.
+        Use company_name and/or branch_name to filter.
+        Set include_overdue=False to exclude employees whose probation has ended but flag not updated.
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return {"error": "Not authenticated. Please login first."}
+
+        query = """
+            SELECT ce.employee_name, ce.designation, ce.date_of_joining,
+                   ce.probation_period, c.name as company_name, cb.name as branch_name,
+                   cd.name as department_name
+            FROM company_employee ce
+            JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+            WHERE ce.is_deleted = '0'
+              AND ce.employee_status = 3
+              AND ce.is_probation_period_running = '1'
+        """
+        params = []
+        param_idx = 1
+
+        if company_name:
+            query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+            params.append(f"%{company_name}%")
+            param_idx += 1
+
+        if branch_name:
+            query += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+            params.append(f"%{branch_name}%")
+            param_idx += 1
+
+        query = apply_company_filter(ctx, query, "ce")
+        query += " ORDER BY ce.date_of_joining DESC"
+
+        rows = fetch_all(query, params) if params else fetch_all(query)
+
+        today = datetime.now().date()
+        employees = []
+        overdue_count = 0
+        ending_soon_count = 0  # Within 30 days
+
+        for row in rows:
+            doj_raw = row.get("date_of_joining")
+            probation_months = row.get("probation_period") or 0
+
+            # Parse DOJ
+            doj_date = None
+            if doj_raw:
+                if isinstance(doj_raw, str):
+                    doj_date = datetime.strptime(doj_raw.split('T')[0], "%Y-%m-%d").date()
+                elif hasattr(doj_raw, 'date'):
+                    doj_date = doj_raw.date() if callable(getattr(doj_raw, 'date', None)) else doj_raw
+                elif hasattr(doj_raw, 'year'):
+                    doj_date = date(doj_raw.year, doj_raw.month, doj_raw.day)
+
+            # Calculate probation end date
+            probation_end = None
+            is_overdue = False
+            days_remaining = None
+
+            if doj_date and probation_months > 0:
+                probation_end = _add_months(doj_date, probation_months)
+                if probation_end < today:
+                    is_overdue = True
+                    overdue_count += 1
+                    days_remaining = (probation_end - today).days  # Negative
+                else:
+                    days_remaining = (probation_end - today).days
+                    if days_remaining <= 30:
+                        ending_soon_count += 1
+
+            # Skip overdue if not included
+            if is_overdue and not include_overdue:
+                continue
+
+            emp_data = {
+                "employee_name": row.get("employee_name"),
+                "designation": row.get("designation"),
+                "department": row.get("department_name"),
+                "company_name": row.get("company_name"),
+                "branch_name": row.get("branch_name"),
+                "date_of_joining": str(doj_date) if doj_date else None,
+                "probation_months": probation_months,
+                "probation_end_date": str(probation_end) if probation_end else None,
+                "days_remaining": days_remaining,
+                "is_overdue": is_overdue
+            }
+            employees.append(emp_data)
+
+        # Sort: overdue first, then by days remaining
+        employees.sort(key=lambda x: (not x["is_overdue"], x["days_remaining"] if x["days_remaining"] is not None else 9999))
+
+        result = {
+            "total_in_probation": len(employees),
+            "overdue_count": overdue_count,
+            "ending_within_30_days": ending_soon_count,
+            "employees": employees
+        }
+
+        if company_name:
+            result["company_filter"] = company_name
+        if branch_name:
+            result["branch_filter"] = branch_name
+
+        return result

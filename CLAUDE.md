@@ -48,3 +48,9 @@ After connecting, users can:
 - Primary = company with most attendance records
 - Use `company_name="all"` for all companies
 - Use `company_name="CompanyName"` for specific company
+
+## SQL Query Guidelines
+When running custom SQL queries:
+1. **First time querying a table**: Always use `get_table_schema` first to check column names and types
+2. **Subsequent queries on same table**: Use chat context - no need to fetch schema again if already retrieved in conversation
+3. **RBAC is auto-applied**: Queries are filtered based on user's access level

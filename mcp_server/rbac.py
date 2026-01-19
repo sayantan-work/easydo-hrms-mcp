@@ -1,6 +1,11 @@
 """Role-Based Access Control helpers with multi-company support."""
 from .auth import UserContext
 
+# Role IDs for RBAC
+ROLE_COMPANY_ADMIN = 1
+ROLE_BRANCH_MANAGER = 2
+ROLE_EMPLOYEE = 3
+
 # Sensitive fields that should be hidden except for own profile or super admin
 SENSITIVE_FIELDS = [
     "pan_number",
@@ -11,6 +16,23 @@ SENSITIVE_FIELDS = [
     "personal_email",
     "emergency_contact_number",
 ]
+
+HIDDEN_VALUE = "***HIDDEN***"
+
+
+def _build_company_filter(company, prefix: str) -> str:
+    """Build SQL filter clause for a single company based on role."""
+    if company.role_id == ROLE_COMPANY_ADMIN:
+        return f"{prefix}company_id = {company.company_id}"
+
+    if company.role_id == ROLE_BRANCH_MANAGER:
+        return (
+            f"({prefix}company_id = {company.company_id} "
+            f"AND {prefix}company_branch_id = {company.company_branch_id})"
+        )
+
+    # Employee (role 3) - own data only
+    return f"{prefix}company_employee_id = {company.company_employee_id}"
 
 
 def apply_company_filter(ctx: UserContext, base_query: str, table_alias: str = "") -> str:
@@ -23,35 +45,27 @@ def apply_company_filter(ctx: UserContext, base_query: str, table_alias: str = "
     if ctx.is_super_admin:
         return base_query
 
-    prefix = f"{table_alias}." if table_alias else ""
-
     if not ctx.companies:
-        # No companies - return impossible condition
         return f"{base_query} AND 1=0"
 
-    # Build filter for each company based on role
-    company_filters = []
-    for comp in ctx.companies:
-        if comp.role_id == 1:  # Company Admin - all branches
-            company_filters.append(f"{prefix}company_id = {comp.company_id}")
-        elif comp.role_id == 2:  # Branch Manager - own branch only
-            company_filters.append(
-                f"({prefix}company_id = {comp.company_id} AND {prefix}company_branch_id = {comp.company_branch_id})"
-            )
-        else:  # Employee (role 3) - own data only
-            company_filters.append(f"{prefix}company_employee_id = {comp.company_employee_id}")
+    prefix = f"{table_alias}." if table_alias else ""
+    company_filters = [_build_company_filter(comp, prefix) for comp in ctx.companies]
 
-    # Combine with OR
     if len(company_filters) == 1:
         return f"{base_query} AND {company_filters[0]}"
-    else:
-        combined = " OR ".join(company_filters)
-        return f"{base_query} AND ({combined})"
+
+    combined = " OR ".join(company_filters)
+    return f"{base_query} AND ({combined})"
 
 
-def get_company_employee_ids(ctx: UserContext) -> list:
-    """Get all company_employee_ids for the user."""
-    return [c.company_employee_id for c in ctx.companies]
+def _is_own_employee_id(ctx: UserContext, employee_id: int) -> bool:
+    """Check if the given employee ID belongs to the current user."""
+    return employee_id in ctx.get_all_company_employee_ids()
+
+
+def _has_manager_role(ctx: UserContext) -> bool:
+    """Check if user has any manager role (admin or branch manager) in any company."""
+    return any(c.role_id != ROLE_EMPLOYEE for c in ctx.companies)
 
 
 def can_view_employee(ctx: UserContext, target_employee_id: int) -> bool:
@@ -59,13 +73,11 @@ def can_view_employee(ctx: UserContext, target_employee_id: int) -> bool:
     if ctx.is_super_admin:
         return True
 
-    # Check if target is one of user's own employee IDs
-    if target_employee_id in get_company_employee_ids(ctx):
+    if _is_own_employee_id(ctx, target_employee_id):
         return True
 
-    # For managers, they can view if employee is in their scope
-    # This will be filtered by company/branch in query
-    return not all(c.role_id == 3 for c in ctx.companies)
+    # Managers can view employees in their scope (filtered by company/branch in query)
+    return _has_manager_role(ctx)
 
 
 def can_view_sensitive_fields(ctx: UserContext, target_employee_id: int) -> bool:
@@ -73,8 +85,7 @@ def can_view_sensitive_fields(ctx: UserContext, target_employee_id: int) -> bool
     if ctx.is_super_admin:
         return True
 
-    # Can only view own sensitive data
-    return target_employee_id in get_company_employee_ids(ctx)
+    return _is_own_employee_id(ctx, target_employee_id)
 
 
 def filter_sensitive_fields(ctx: UserContext, data: dict, target_employee_id: int) -> dict:
@@ -83,8 +94,8 @@ def filter_sensitive_fields(ctx: UserContext, data: dict, target_employee_id: in
         return data
 
     filtered = data.copy()
-    for field in SENSITIVE_FIELDS:
-        if field in filtered:
-            filtered[field] = "***HIDDEN***"
+    for field_name in SENSITIVE_FIELDS:
+        if field_name in filtered:
+            filtered[field_name] = HIDDEN_VALUE
 
     return filtered

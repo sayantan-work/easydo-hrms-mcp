@@ -629,3 +629,130 @@ def register(mcp):
 
         _add_filters(result, company_name, branch_name)
         return result
+
+    @mcp.tool()
+    def get_reporting_managers(
+        company_name: str = None,
+        branch_name: str = None,
+        group_by_branch: bool = False,
+    ) -> dict:
+        """
+        Get list of reporting managers in a company with their direct report counts.
+        Shows manager name, designation, branch, and number of employees reporting to them.
+        Use group_by_branch=True to see breakdown by branch.
+        Use company_name and/or branch_name to filter.
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return AUTH_ERROR
+
+        if group_by_branch:
+            # Group by branch - shows managers per branch
+            base_query = """
+                SELECT
+                    cb.name as branch_name,
+                    rm.employee_name as manager_name,
+                    rm.designation as manager_designation,
+                    COUNT(ce.id) as direct_reports_count
+                FROM company_employee ce
+                JOIN company c ON ce.company_id = c.id
+                JOIN company_employee rm ON ce.reporting_manager_id = rm.id
+                JOIN company_branch cb ON ce.company_branch_id = cb.id
+                WHERE ce.reporting_manager_id IS NOT NULL
+                  AND ce.reporting_manager_id != 0
+                  AND ce.status = 1
+                  AND ce.is_deleted = '0'
+                  AND rm.status = 1
+                  AND rm.is_deleted = '0'
+            """
+
+            qb = QueryBuilder(base_query)
+            qb.add_company_filter(company_name)
+            qb.add_branch_filter(branch_name)
+            qb.apply_rbac(ctx, "ce")
+            qb.append(" GROUP BY cb.id, cb.name, rm.id, rm.employee_name, rm.designation")
+            qb.append(" ORDER BY cb.name, direct_reports_count DESC")
+
+            rows = fetch_all(qb.query, qb.params) if qb.params else fetch_all(qb.query)
+
+            # Group results by branch
+            branches = {}
+            for row in rows:
+                branch = row.get("branch_name") or "Unknown"
+                if branch not in branches:
+                    branches[branch] = {"managers": [], "total_reports": 0}
+                branches[branch]["managers"].append({
+                    "manager_name": row.get("manager_name"),
+                    "designation": row.get("manager_designation"),
+                    "direct_reports": _safe_int(row.get("direct_reports_count")),
+                })
+                branches[branch]["total_reports"] += _safe_int(row.get("direct_reports_count"))
+
+            # Calculate totals
+            total_managers = sum(len(b["managers"]) for b in branches.values())
+            total_reports = sum(b["total_reports"] for b in branches.values())
+
+            result = {
+                "group_by": "branch",
+                "total_reporting_managers": total_managers,
+                "total_employees_with_managers": total_reports,
+                "branch_count": len(branches),
+                "branches": {
+                    name: {
+                        "manager_count": len(data["managers"]),
+                        "total_reports": data["total_reports"],
+                        "managers": data["managers"],
+                    }
+                    for name, data in branches.items()
+                },
+            }
+        else:
+            # Simple list of all managers
+            base_query = """
+                SELECT
+                    rm.employee_name as manager_name,
+                    rm.designation as manager_designation,
+                    cb_rm.name as manager_branch,
+                    COUNT(ce.id) as direct_reports_count
+                FROM company_employee ce
+                JOIN company c ON ce.company_id = c.id
+                JOIN company_employee rm ON ce.reporting_manager_id = rm.id
+                LEFT JOIN company_branch cb ON ce.company_branch_id = cb.id
+                LEFT JOIN company_branch cb_rm ON rm.company_branch_id = cb_rm.id
+                WHERE ce.reporting_manager_id IS NOT NULL
+                  AND ce.reporting_manager_id != 0
+                  AND ce.status = 1
+                  AND ce.is_deleted = '0'
+                  AND rm.status = 1
+                  AND rm.is_deleted = '0'
+            """
+
+            qb = QueryBuilder(base_query)
+            qb.add_company_filter(company_name)
+            qb.add_branch_filter(branch_name)
+            qb.apply_rbac(ctx, "ce")
+            qb.append(" GROUP BY rm.id, rm.employee_name, rm.designation, cb_rm.name")
+            qb.append(" ORDER BY direct_reports_count DESC")
+
+            rows = fetch_all(qb.query, qb.params) if qb.params else fetch_all(qb.query)
+
+            managers = [
+                {
+                    "manager_name": row.get("manager_name"),
+                    "designation": row.get("manager_designation"),
+                    "branch": row.get("manager_branch"),
+                    "direct_reports": _safe_int(row.get("direct_reports_count")),
+                }
+                for row in rows
+            ]
+
+            total_reports = sum(m["direct_reports"] for m in managers)
+
+            result = {
+                "total_reporting_managers": len(managers),
+                "total_employees_with_managers": total_reports,
+                "managers": managers,
+            }
+
+        _add_filters(result, company_name, branch_name)
+        return result

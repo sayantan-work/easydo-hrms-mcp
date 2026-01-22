@@ -754,3 +754,277 @@ def register(mcp):
         }
 
         return _add_filters_to_result(result, company_name, branch_name)
+
+    @mcp.tool()
+    def get_attendance_report(
+        company_name: str = None,
+        branch_name: str = None,
+        month: str = None,
+        limit: int = 10
+    ) -> dict:
+        """
+        Get attendance analytics report for a month.
+        Shows: most absent employees, most late employees, most leaves taken.
+        Month format: YYYY-MM (defaults to current month).
+        Limit: number of top employees to show (default 10).
+        """
+        ctx, err = _require_auth()
+        if err:
+            return err
+
+        if not month:
+            month = _current_month_str()
+
+        # Validate month format
+        try:
+            year, mon = map(int, month.split('-'))
+            if mon < 1 or mon > 12:
+                return {"error": f"Invalid month: {month}. Use YYYY-MM format."}
+            days_in_month = calendar.monthrange(year, mon)[1]
+        except (ValueError, AttributeError):
+            return {"error": f"Invalid month format: {month}. Use YYYY-MM format."}
+
+        # Determine the last day to consider (for current month, use today)
+        today = datetime.now()
+        if year == today.year and mon == today.month:
+            last_day = today.day
+        else:
+            last_day = days_in_month
+
+        # Build company/branch filter clause
+        filter_clause = ""
+        params_base = []
+        param_idx = 1
+
+        if company_name:
+            filter_clause += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+            params_base.append(f"%{company_name}%")
+            param_idx += 1
+
+        if branch_name:
+            filter_clause += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+            params_base.append(f"%{branch_name}%")
+            param_idx += 1
+
+        # 1. Get all active employees with their working days config
+        emp_query = f"""
+            SELECT ce.id as emp_id, ce.employee_name, ce.designation,
+                   ce.date_of_joining, ce.working_day as emp_working_day,
+                   cb.working_day as branch_working_day, cb.id as branch_id,
+                   cb.name as branch_name, c.name as company_name
+            FROM company_employee ce
+            JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+            {filter_clause}
+        """
+        emp_query = apply_company_filter(ctx, emp_query, "ce")
+        employees = fetch_all(emp_query, params_base)
+
+        if not employees:
+            return {"error": "No employees found in your accessible scope."}
+
+        emp_ids = [e["emp_id"] for e in employees]
+
+        # 2. Get attendance records for the month (count present days per employee)
+        placeholders = ", ".join([f"${i+1}" for i in range(len(emp_ids))])
+        month_param_idx = len(emp_ids) + 1
+
+        attendance_query = f"""
+            SELECT company_employee_id,
+                   COUNT(DISTINCT date) as present_days,
+                   SUM(CASE WHEN is_late = 1 THEN 1 ELSE 0 END) as late_count,
+                   SUM(CASE WHEN is_half_day = 1 THEN 1 ELSE 0 END) as half_day_count
+            FROM company_attendance
+            WHERE company_employee_id IN ({placeholders})
+              AND TO_CHAR(date, 'YYYY-MM') = ${month_param_idx}
+            GROUP BY company_employee_id
+        """
+        attendance_rows = fetch_all(attendance_query, emp_ids + [month])
+        attendance_map = {r["company_employee_id"]: r for r in attendance_rows}
+
+        # 3. Get approved leaves for the month (simple count)
+        leave_query = f"""
+            SELECT cap.company_employee_id, cap.start_date, cap.end_date
+            FROM company_approval cap
+            WHERE cap.company_employee_id IN ({placeholders})
+              AND cap.media_type = 'LEAVE_APPROVAL'
+              AND UPPER(cap.status) = 'APPROVED'
+              AND (TO_CHAR(cap.start_date, 'YYYY-MM') = ${month_param_idx}
+                   OR TO_CHAR(cap.end_date, 'YYYY-MM') = ${month_param_idx})
+        """
+        leave_rows = fetch_all(leave_query, emp_ids + [month])
+
+        # Calculate leave days per employee (only count days within the month)
+        leave_map = {}
+        month_start_date = date(year, mon, 1)
+        month_end_date = date(year, mon, days_in_month)
+
+        for lr in leave_rows:
+            emp_id = lr["company_employee_id"]
+            start_raw = lr.get("start_date")
+            end_raw = lr.get("end_date")
+
+            if not start_raw:
+                continue
+
+            # Parse start date (DB returns date objects, but handle strings too)
+            # Check datetime first since datetime is subclass of date
+            if isinstance(start_raw, datetime):
+                start = start_raw.date()
+            elif isinstance(start_raw, date):
+                start = start_raw
+            elif isinstance(start_raw, str):
+                start = datetime.strptime(start_raw.split('T')[0], "%Y-%m-%d").date()
+            else:
+                continue
+
+            # Parse end date
+            if not end_raw:
+                end = start
+            elif isinstance(end_raw, datetime):
+                end = end_raw.date()
+            elif isinstance(end_raw, date):
+                end = end_raw
+            elif isinstance(end_raw, str):
+                end = datetime.strptime(end_raw.split('T')[0], "%Y-%m-%d").date()
+            else:
+                end = start
+
+            # Clamp to month boundaries
+            effective_start = max(start, month_start_date)
+            effective_end = min(end, month_end_date)
+
+            if effective_start <= effective_end:
+                leave_days_count = (effective_end - effective_start).days + 1
+                leave_map[emp_id] = leave_map.get(emp_id, 0) + leave_days_count
+
+        # 4. Get holidays for branches
+        branch_ids = list(set(e.get("branch_id") for e in employees if e.get("branch_id")))
+        holidays_map = {}  # branch_id -> set of holiday dates
+
+        if branch_ids:
+            branch_placeholders = ", ".join([f"${i+1}" for i in range(len(branch_ids))])
+            holiday_query = f"""
+                SELECT company_branch_id, date
+                FROM company_holiday
+                WHERE company_branch_id IN ({branch_placeholders})
+                  AND TO_CHAR(date, 'YYYY-MM') = ${len(branch_ids) + 1}
+            """
+            holiday_rows = fetch_all(holiday_query, branch_ids + [month])
+            for hr in holiday_rows:
+                bid = hr["company_branch_id"]
+                if bid not in holidays_map:
+                    holidays_map[bid] = set()
+                hday = _extract_day_from_date(hr.get("date"))
+                if hday:
+                    holidays_map[bid].add(hday)
+
+        # 5. Calculate absences for each employee
+        absent_list = []
+        late_list = []
+        leave_list = []
+
+        for emp in employees:
+            emp_id = emp["emp_id"]
+            emp_name = emp["employee_name"]
+            designation = emp.get("designation", "")
+            branch = emp.get("branch_name", "")
+            company = emp.get("company_name", "")
+
+            # Get working days config
+            working_day_config = emp.get("emp_working_day") or emp.get("branch_working_day")
+            working_days_set = _parse_working_days(working_day_config)
+
+            # Parse DOJ
+            doj_raw = emp.get("date_of_joining")
+            doj_date = _parse_date(doj_raw)
+
+            # Get branch holidays
+            branch_id = emp.get("branch_id")
+            branch_holidays = holidays_map.get(branch_id, set())
+
+            # Count expected working days
+            expected_working_days = 0
+            for day in range(1, last_day + 1):
+                current_date = date(year, mon, day)
+                weekday = calendar.weekday(year, mon, day)
+
+                # Skip if before DOJ
+                if doj_date and current_date < doj_date:
+                    continue
+
+                # Skip weekends (non-working days)
+                if weekday not in working_days_set:
+                    continue
+
+                # Skip holidays
+                if day in branch_holidays:
+                    continue
+
+                expected_working_days += 1
+
+            # Get actual attendance (cast to int for safety)
+            att_data = attendance_map.get(emp_id, {})
+            present_days = int(att_data.get("present_days") or 0)
+            late_count = int(att_data.get("late_count") or 0)
+
+            # Get leave days
+            leave_days = int(leave_map.get(emp_id, 0))
+
+            # Calculate absences (expected - present - leave)
+            absent_days = max(0, int(expected_working_days) - present_days - leave_days)
+
+            if absent_days > 0:
+                absent_list.append({
+                    "employee_name": emp_name,
+                    "designation": designation,
+                    "branch": branch,
+                    "company": company,
+                    "absent_days": absent_days,
+                    "expected_days": expected_working_days,
+                    "present_days": present_days,
+                    "leave_days": leave_days
+                })
+
+            if late_count > 0:
+                late_list.append({
+                    "employee_name": emp_name,
+                    "designation": designation,
+                    "branch": branch,
+                    "company": company,
+                    "late_count": int(late_count)
+                })
+
+            if leave_days > 0:
+                leave_list.append({
+                    "employee_name": emp_name,
+                    "designation": designation,
+                    "branch": branch,
+                    "company": company,
+                    "leave_days": leave_days
+                })
+
+        # Sort and limit
+        absent_list.sort(key=lambda x: x["absent_days"], reverse=True)
+        late_list.sort(key=lambda x: x["late_count"], reverse=True)
+        leave_list.sort(key=lambda x: x["leave_days"], reverse=True)
+
+        result = {
+            "month": month,
+            "total_employees": len(employees),
+            "days_analyzed": last_day,
+            "most_absent": absent_list[:limit],
+            "most_late": late_list[:limit],
+            "most_leaves": leave_list[:limit],
+            "summary": {
+                "employees_with_absences": len(absent_list),
+                "employees_with_lates": len(late_list),
+                "employees_with_leaves": len(leave_list),
+                "total_absent_days": sum(e["absent_days"] for e in absent_list),
+                "total_late_instances": sum(e["late_count"] for e in late_list),
+                "total_leave_days": sum(e["leave_days"] for e in leave_list)
+            }
+        }
+
+        return _add_filters_to_result(result, company_name, branch_name)

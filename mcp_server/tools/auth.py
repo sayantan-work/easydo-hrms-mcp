@@ -5,7 +5,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-from ..auth import get_user_context
+from ..auth import get_user_context, SUPER_ADMIN_PHONE, normalize_phone
 from ..db import get_current_environment
 
 load_dotenv()
@@ -217,13 +217,51 @@ def register(mcp):
         if error:
             return {"error": error}
 
+        # Check if super admin - bypass OTP
+        if SUPER_ADMIN_PHONE and normalize_phone(phone) == normalize_phone(SUPER_ADMIN_PHONE):
+            # Temporarily set environment so DB queries work
+            save_credentials({"environment": environment})
+
+            # Try to fetch actual user record from DB
+            from ..db import fetch_one
+            user_data = None
+            try:
+                # Phone stored as contact_number (without country code) or with +91 prefix
+                phone_digits = normalize_phone(phone)  # Last 10 digits
+                user_data = fetch_one(
+                    "SELECT id, user_name FROM users WHERE contact_number = $1 OR contact_number = $2 LIMIT 1",
+                    [phone_digits, phone]
+                )
+            except Exception:
+                pass  # DB lookup failed, use defaults
+
+            creds = {
+                "user_id": user_data.get("id") if user_data else None,
+                "user_name": user_data.get("user_name", "Super Admin") if user_data else "Super Admin",
+                "phone": phone,
+                "token": None,
+                "token_expires_at": None,
+                "environment": environment,
+            }
+            save_credentials(creds)
+            cleanup_pending_login()
+
+            return {
+                "success": True,
+                "message": f"Super Admin login successful! Connected to {environment.upper()}. No OTP required.",
+                "user_id": creds["user_id"],
+                "user_name": creds["user_name"],
+                "environment": environment,
+                "is_super_admin": True,
+            }
+
         save_pending_login(environment, device_type)
 
         try:
             resp = requests.post(
                 get_api_url("/api/v2/user-otp-send"),
                 headers={**API_HEADERS, "device_type": device_type},
-                json={"fcm_token": "dgtewtwet", "phone_no": phone},
+                json={"fcm_token": "dgtewtwet", "phone_no": phone, "is_development": 1},
                 timeout=10,
             )
             data = resp.json()

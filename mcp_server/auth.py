@@ -1,16 +1,24 @@
 """Authentication and user context management with multi-company RBAC."""
-import os
 import json
+import os
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List, Optional
+
 from dotenv import load_dotenv
-from .db import fetch_one, fetch_all
+
+from .db import CREDENTIALS_FILE, fetch_all, fetch_one
 
 # Load environment variables
 load_dotenv()
 
-# Super admin user ID (bypasses all RBAC) - from .env
-SUPER_ADMIN_USER_ID = int(os.getenv("SUPER_ADMIN_USER_ID", "0"))
+# Super admin phone number (bypasses all RBAC) - from .env
+SUPER_ADMIN_PHONE = os.getenv("SUPER_ADMIN_PHONE", "").strip()
+
+
+def normalize_phone(phone: str) -> str:
+    """Normalize phone number for comparison (last 10 digits)."""
+    phone = phone.strip().replace(" ", "").replace("-", "").replace("+", "")
+    return phone[-10:] if len(phone) >= 10 else phone
 
 
 @dataclass
@@ -36,11 +44,15 @@ class UserContext:
     """User context with multi-company RBAC support."""
     user_id: int
     user_name: str
+    phone: str = ""
     companies: List[CompanyContext] = field(default_factory=list)
 
     @property
     def is_super_admin(self) -> bool:
-        return self.user_id == SUPER_ADMIN_USER_ID
+        """Check if user is super admin by phone number."""
+        if not self.phone or not SUPER_ADMIN_PHONE:
+            return False
+        return normalize_phone(self.phone) == normalize_phone(SUPER_ADMIN_PHONE)
 
     @property
     def primary_company(self) -> Optional[CompanyContext]:
@@ -101,11 +113,10 @@ class UserContext:
 
 def load_credentials() -> Optional[dict]:
     """Load credentials from ~/.easydo/credentials.json"""
-    cred_file = os.path.expanduser("~/.easydo/credentials.json")
-    if os.path.exists(cred_file):
-        with open(cred_file, "r") as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(CREDENTIALS_FILE):
+        return None
+    with open(CREDENTIALS_FILE, "r") as f:
+        return json.load(f)
 
 
 def get_user_context() -> Optional[UserContext]:
@@ -122,10 +133,17 @@ def get_user_context() -> Optional[UserContext]:
         return None
 
     user_id = creds.get("user_id")
-    if not user_id:
-        return None
-
     user_name = creds.get("user_name", "Unknown")
+    phone = creds.get("phone", "")
+
+    # Check if super admin by phone (can work even without user_id in DB)
+    is_super = SUPER_ADMIN_PHONE and phone and normalize_phone(phone) == normalize_phone(SUPER_ADMIN_PHONE)
+
+    # If no user_id but is super admin, return context with no companies
+    if not user_id:
+        if is_super:
+            return UserContext(user_id=0, user_name=user_name or "Super Admin", phone=phone, companies=[])
+        return None
 
     # Query ALL company_employee records with attendance counts
     query = """
@@ -171,10 +189,10 @@ def get_user_context() -> Optional[UserContext]:
                 is_primary=(i == 0)  # First row has highest attendance (ORDER BY DESC)
             ))
 
-        return UserContext(user_id=user_id, user_name=user_name, companies=companies)
+        return UserContext(user_id=user_id, user_name=user_name, phone=phone, companies=companies)
 
     except Exception:
-        return UserContext(user_id=user_id, user_name=user_name, companies=[])
+        return UserContext(user_id=user_id, user_name=user_name, phone=phone, companies=[])
 
 
 def require_auth(func):

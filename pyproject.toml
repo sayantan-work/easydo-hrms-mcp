@@ -13,6 +13,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+# Install with: pip install -e ".[direct]"
+direct = [
+    "psycopg2-binary>=2.9.0",
+]
+
 [project.scripts]
 easydo-hrms = "mcp_server.server:mcp.run"
 

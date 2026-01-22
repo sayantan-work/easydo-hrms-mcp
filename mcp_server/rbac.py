@@ -41,7 +41,11 @@ def apply_company_filter(ctx: UserContext, base_query: str, table_alias: str = "
 
     For multi-company users, generates OR conditions for each company
     with appropriate RBAC per company role.
+
+    Inserts the filter after WHERE clause but before GROUP BY/ORDER BY/LIMIT.
     """
+    import re
+
     if ctx.is_super_admin:
         return base_query
 
@@ -52,10 +56,28 @@ def apply_company_filter(ctx: UserContext, base_query: str, table_alias: str = "
     company_filters = [_build_company_filter(comp, prefix) for comp in ctx.companies]
 
     if len(company_filters) == 1:
-        return f"{base_query} AND {company_filters[0]}"
+        filter_clause = company_filters[0]
+    else:
+        filter_clause = f"({' OR '.join(company_filters)})"
 
-    combined = " OR ".join(company_filters)
-    return f"{base_query} AND ({combined})"
+    # Find the position to insert the filter (before GROUP BY, ORDER BY, LIMIT, or end)
+    # Case-insensitive search for these keywords
+    insert_keywords = [r'\bGROUP\s+BY\b', r'\bORDER\s+BY\b', r'\bLIMIT\b', r'\bHAVING\b']
+
+    insert_pos = len(base_query)
+    for pattern in insert_keywords:
+        match = re.search(pattern, base_query, re.IGNORECASE)
+        if match and match.start() < insert_pos:
+            insert_pos = match.start()
+
+    # Insert the AND filter at the correct position
+    before = base_query[:insert_pos].rstrip()
+    after = base_query[insert_pos:]
+
+    if after:
+        return f"{before} AND {filter_clause} {after}"
+    else:
+        return f"{before} AND {filter_clause}"
 
 
 def _is_own_employee_id(ctx: UserContext, employee_id: int) -> bool:

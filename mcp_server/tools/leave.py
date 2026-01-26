@@ -240,40 +240,6 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def who_is_on_leave_today(company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get list of employees who are on leave today.
-        Use company_name and/or branch_name to filter.
-        """
-        ctx, err = _require_auth()
-        if err:
-            return err
-
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        query = """
-            SELECT ce.employee_name, ce.designation, cd.name as department_name,
-                   cb.name as branch_name, c.name as company_name,
-                   ca.leave_type, ca.start_date, ca.end_date
-            FROM company_approval ca
-            JOIN company_employee ce ON ce.id = ca.company_employee_id
-            JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            LEFT JOIN company_department cd ON cd.id = ce.company_role_id
-            WHERE ce.is_deleted = '0' AND ca.media_type = 'leave' AND ca.status = 'approved'
-            AND $1 BETWEEN ca.start_date AND ca.end_date
-        """
-        params = [today]
-
-        query, params, _ = _build_filtered_query(query, ctx, params, 2, company_name, branch_name, "ce")
-        query += " ORDER BY c.name, ce.employee_name"
-
-        rows = fetch_all(query, params)
-
-        result = {"date": today, "count": len(rows), "on_leave": rows}
-        return _add_filters_to_result(result, company_name, branch_name)
-
-    @mcp.tool()
     def get_leave_history(employee_name: str = None, year: int = None, company_name: str = None) -> dict:
         """
         Get leave history showing all leave requests with dates and status.

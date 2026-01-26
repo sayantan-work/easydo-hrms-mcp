@@ -244,11 +244,15 @@ def register(mcp):
         """
         Search employee directory for public info (name, department, designation).
         Returns basic public information only.
+        Supports fuzzy matching for typos.
         """
         ctx, err = _require_auth()
         if err:
             return err
 
+        from ..fuzzy import fuzzy_match
+
+        # First try exact LIKE match
         sql = """
             SELECT ce.id, ce.employee_name, ce.designation,
                    cd.name as department_name, cb.name as branch_name, c.name as company_name
@@ -263,6 +267,29 @@ def register(mcp):
         sql += " ORDER BY ce.employee_name LIMIT 20"
 
         rows = fetch_all(sql, [f"%{query}%"])
+
+        # If no results, try fuzzy matching
+        if not rows:
+            # Get all employee names for fuzzy matching
+            all_sql = """
+                SELECT ce.id, ce.employee_name, ce.designation,
+                       cd.name as department_name, cb.name as branch_name, c.name as company_name
+                FROM company_employee ce
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+            """
+            all_sql = apply_company_filter(ctx, all_sql, "ce")
+            all_employees = fetch_all(all_sql)
+
+            employee_names = [e["employee_name"] for e in all_employees]
+            matches = fuzzy_match(query, employee_names, threshold=60, limit=20)
+
+            if matches:
+                matched_names = {m[0] for m in matches}
+                rows = [e for e in all_employees if e["employee_name"] in matched_names]
+
         return {"count": len(rows), "employees": rows}
 
     @mcp.tool()
@@ -364,11 +391,15 @@ def register(mcp):
         """
         Search for companies by name.
         Returns company details including branches count.
+        Supports fuzzy matching for typos (e.g., "liberty infospce" -> "Liberty Infospace").
         """
         ctx, err = _require_auth()
         if err:
             return err
 
+        from ..fuzzy import fuzzy_match, normalize_company_name, build_fuzzy_sql_pattern
+
+        # First try exact LIKE match
         sql = """
             SELECT id, name as company_name
             FROM company
@@ -376,6 +407,25 @@ def register(mcp):
             ORDER BY name LIMIT 20
         """
         rows = fetch_all(sql, [f"%{query}%"])
+
+        # If no results, try fuzzy matching
+        if not rows:
+            # Get all company names for fuzzy matching
+            all_companies = fetch_all("SELECT id, name FROM company WHERE status = 1")
+            company_names = [c["name"] for c in all_companies]
+
+            # Find fuzzy matches (lower threshold to catch typos like "infspace" -> "infospace")
+            matches = fuzzy_match(query, company_names, threshold=40, limit=10)
+
+            if matches:
+                # Get IDs for matched companies
+                matched_names = [m[0] for m in matches]
+                rows = [
+                    {"id": c["id"], "company_name": c["name"], "fuzzy_score": score}
+                    for c in all_companies
+                    for name, score in matches
+                    if c["name"] == name
+                ]
 
         for row in rows:
             company_id = row["id"]

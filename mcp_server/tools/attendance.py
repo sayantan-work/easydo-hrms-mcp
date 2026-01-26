@@ -572,64 +572,24 @@ def register(mcp):
         return result
 
     @mcp.tool()
-    def who_is_late_today(company_name: str = None, branch_name: str = None) -> dict:
+    def get_daily_attendance(
+        date: str = None,
+        status: str = "all",
+        company_name: str = None,
+        branch_name: str = None
+    ) -> dict:
         """
-        Get employees who were late today.
-        Also includes employees who took half-day in a separate list.
-        Use company_name and/or branch_name to filter.
-        """
-        ctx, err = _require_auth()
-        if err:
-            return err
-
-        today = _today_str()
-
-        base_select = """
-            SELECT ce.employee_name, ce.designation, cd.name as department_name,
-                   cb.name as branch_name, c.name as company_name,
-                   TO_TIMESTAMP(ca.check_in_time / 1000) as check_in_time
-        """
-        base_from = """
-            FROM company_attendance ca
-            JOIN company_employee ce ON ce.id = ca.company_employee_id
-            JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            LEFT JOIN company_department cd ON cd.id = ce.company_role_id
-            WHERE ce.is_deleted = '0' AND ca.date = $1
-        """
-
-        late_query = base_select + base_from + " AND ca.is_late = 1"
-        half_day_query = base_select + ", TO_TIMESTAMP(ca.check_out_time / 1000) as check_out_time" + base_from + " AND ca.is_half_day = 1"
-
-        params = [today]
-        param_idx = 2
-
-        late_query, params = _build_filtered_query(late_query, ctx, params, param_idx, company_name, branch_name)
-        late_query += " ORDER BY ca.check_in_time DESC"
-
-        # Reset params for half_day query
-        params_hd = [today]
-        half_day_query, params_hd = _build_filtered_query(half_day_query, ctx, params_hd, param_idx, company_name, branch_name)
-        half_day_query += " ORDER BY ca.check_in_time DESC"
-
-        late_rows = fetch_all(late_query, params)
-        half_day_rows = fetch_all(half_day_query, params_hd)
-
-        result = {
-            "date": today,
-            "late_count": len(late_rows),
-            "half_day_count": len(half_day_rows),
-            "late_employees": late_rows,
-            "half_day_employees": half_day_rows
-        }
-
-        return _add_filters_to_result(result, company_name, branch_name)
-
-    @mcp.tool()
-    def get_present_employees(date: str = None, company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get employees who are present (checked in) on a specific date.
+        Get daily attendance data for employees.
         Date format: YYYY-MM-DD (defaults to today).
+
+        Status options:
+        - 'present': Employees who checked in
+        - 'absent': Employees who didn't check in (excludes leave, holidays, week-offs)
+        - 'late': Employees who were late
+        - 'on_leave': Employees on approved leave
+        - 'half_day': Employees who took half-day
+        - 'all': Summary with counts for all statuses
+
         Use company_name and/or branch_name to filter.
         """
         ctx, err = _require_auth()
@@ -639,119 +599,195 @@ def register(mcp):
         if not date:
             date = _today_str()
 
-        query = """
-            SELECT ce.employee_name, ce.designation, cd.name as department_name,
-                   cb.name as branch_name, c.name as company_name,
-                   TO_TIMESTAMP(ca.check_in_time / 1000) as check_in_time,
-                   TO_TIMESTAMP(ca.check_out_time / 1000) as check_out_time,
-                   ca.is_late, ca.is_half_day
-            FROM company_attendance ca
-            JOIN company_employee ce ON ce.id = ca.company_employee_id
-            JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            LEFT JOIN company_department cd ON cd.id = ce.company_role_id
-            WHERE ce.is_deleted = '0' AND ca.date = $1
-        """
-        params = [date]
-        query, params = _build_filtered_query(query, ctx, params, 2, company_name, branch_name)
-        query += " ORDER BY ca.check_in_time DESC"
+        status = status.lower().strip()
+        valid_statuses = ['present', 'absent', 'late', 'on_leave', 'half_day', 'all']
+        if status not in valid_statuses:
+            return {"error": f"Invalid status '{status}'. Use: {', '.join(valid_statuses)}"}
 
-        rows = fetch_all(query, params)
+        result = {"date": date}
 
-        result = {
-            "date": date,
-            "count": len(rows),
-            "present_employees": [
-                {
-                    "employee_name": r.get("employee_name"),
-                    "designation": r.get("designation"),
-                    "department": r.get("department_name"),
-                    "branch": r.get("branch_name"),
-                    "company": r.get("company_name"),
-                    "check_in_time": str(r.get("check_in_time")) if r.get("check_in_time") else None,
-                    "check_out_time": str(r.get("check_out_time")) if r.get("check_out_time") else None,
-                    "is_late": r.get("is_late") == 1,
-                    "is_half_day": r.get("is_half_day") == 1
-                }
-                for r in rows
-            ]
-        }
+        # Helper to build employee data
+        def format_employee(r):
+            return {
+                "employee_name": r.get("employee_name"),
+                "designation": r.get("designation"),
+                "department": r.get("department_name"),
+                "branch": r.get("branch_name"),
+                "company": r.get("company_name")
+            }
 
-        return _add_filters_to_result(result, company_name, branch_name)
+        # PRESENT employees
+        if status in ['present', 'all']:
+            query = """
+                SELECT ce.employee_name, ce.designation, cd.name as department_name,
+                       cb.name as branch_name, c.name as company_name,
+                       TO_TIMESTAMP(ca.check_in_time / 1000) as check_in_time,
+                       TO_TIMESTAMP(ca.check_out_time / 1000) as check_out_time,
+                       ca.is_late, ca.is_half_day
+                FROM company_attendance ca
+                JOIN company_employee ce ON ce.id = ca.company_employee_id
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                WHERE ce.is_deleted = '0' AND ca.date = $1
+            """
+            params = [date]
+            query, params = _build_filtered_query(query, ctx, params, 2, company_name, branch_name)
+            query += " ORDER BY ca.check_in_time DESC"
+            present_rows = fetch_all(query, params)
 
-    @mcp.tool()
-    def get_absent_employees(date: str = None, company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get employees who were absent on a specific date.
-        Date format: YYYY-MM-DD (defaults to today).
-        Excludes employees on approved leave, holidays, and non-working days.
-        """
-        ctx, err = _require_auth()
-        if err:
-            return err
+            if status == 'present':
+                result["count"] = len(present_rows)
+                result["employees"] = [
+                    {**format_employee(r),
+                     "check_in_time": str(r.get("check_in_time")) if r.get("check_in_time") else None,
+                     "check_out_time": str(r.get("check_out_time")) if r.get("check_out_time") else None,
+                     "is_late": r.get("is_late") == 1,
+                     "is_half_day": r.get("is_half_day") == 1}
+                    for r in present_rows
+                ]
+            else:
+                result["present_count"] = len(present_rows)
 
-        if not date:
-            date = _today_str()
+        # LATE employees
+        if status in ['late', 'all']:
+            query = """
+                SELECT ce.employee_name, ce.designation, cd.name as department_name,
+                       cb.name as branch_name, c.name as company_name,
+                       TO_TIMESTAMP(ca.check_in_time / 1000) as check_in_time
+                FROM company_attendance ca
+                JOIN company_employee ce ON ce.id = ca.company_employee_id
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                WHERE ce.is_deleted = '0' AND ca.date = $1 AND ca.is_late = 1
+            """
+            params = [date]
+            query, params = _build_filtered_query(query, ctx, params, 2, company_name, branch_name)
+            query += " ORDER BY ca.check_in_time DESC"
+            late_rows = fetch_all(query, params)
 
-        try:
-            date_obj = datetime.strptime(date, "%Y-%m-%d")
-            day_abbr = DAY_ABBR_REVERSE[date_obj.weekday()]
-        except ValueError:
-            return {"error": f"Invalid date format: {date}. Use YYYY-MM-DD."}
+            if status == 'late':
+                result["count"] = len(late_rows)
+                result["employees"] = [
+                    {**format_employee(r),
+                     "check_in_time": str(r.get("check_in_time")) if r.get("check_in_time") else None}
+                    for r in late_rows
+                ]
+            else:
+                result["late_count"] = len(late_rows)
 
-        query = """
-            SELECT ce.employee_name, ce.designation, cd.name as department_name,
-                   cb.name as branch_name, c.name as company_name
-            FROM company_employee ce
-            LEFT JOIN company_department cd ON cd.id = ce.company_role_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            LEFT JOIN company c ON c.id = ce.company_id
-            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
-              AND ce.id NOT IN (
-                  SELECT ca.company_employee_id
-                  FROM company_attendance ca
-                  WHERE ca.date = $1
-              )
-              AND ce.id NOT IN (
-                  SELECT cap.company_employee_id
-                  FROM company_approval cap
-                  WHERE cap.media_type = 'leave'
-                    AND cap.status = 'approved'
-                    AND $1 BETWEEN cap.start_date AND cap.end_date
-              )
-              AND ce.company_branch_id NOT IN (
-                  SELECT ch.company_branch_id
-                  FROM company_holiday ch
-                  WHERE ch.date = $1
-              )
-              AND (
-                  cb.working_day IS NULL
-                  OR cb.working_day = ''
-                  OR LOWER(cb.working_day) LIKE $2
-              )
-        """
-        params = [date, f"%{day_abbr}%"]
-        query, params = _build_filtered_query(query, ctx, params, 3, company_name, branch_name)
-        query += " ORDER BY ce.employee_name"
+        # HALF_DAY employees
+        if status in ['half_day', 'all']:
+            query = """
+                SELECT ce.employee_name, ce.designation, cd.name as department_name,
+                       cb.name as branch_name, c.name as company_name,
+                       TO_TIMESTAMP(ca.check_in_time / 1000) as check_in_time,
+                       TO_TIMESTAMP(ca.check_out_time / 1000) as check_out_time
+                FROM company_attendance ca
+                JOIN company_employee ce ON ce.id = ca.company_employee_id
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                WHERE ce.is_deleted = '0' AND ca.date = $1 AND ca.is_half_day = 1
+            """
+            params = [date]
+            query, params = _build_filtered_query(query, ctx, params, 2, company_name, branch_name)
+            query += " ORDER BY ca.check_in_time DESC"
+            half_day_rows = fetch_all(query, params)
 
-        rows = fetch_all(query, params)
+            if status == 'half_day':
+                result["count"] = len(half_day_rows)
+                result["employees"] = [
+                    {**format_employee(r),
+                     "check_in_time": str(r.get("check_in_time")) if r.get("check_in_time") else None,
+                     "check_out_time": str(r.get("check_out_time")) if r.get("check_out_time") else None}
+                    for r in half_day_rows
+                ]
+            else:
+                result["half_day_count"] = len(half_day_rows)
 
-        result = {
-            "date": date,
-            "day": date_obj.strftime("%A"),
-            "count": len(rows),
-            "absent_employees": [
-                {
-                    "employee_name": r.get("employee_name"),
-                    "designation": r.get("designation"),
-                    "department": r.get("department_name"),
-                    "branch": r.get("branch_name"),
-                    "company": r.get("company_name")
-                }
-                for r in rows
-            ],
-            "_note": "Excludes: approved leave, holidays, non-working days"
-        }
+        # ON_LEAVE employees
+        if status in ['on_leave', 'all']:
+            query = """
+                SELECT ce.employee_name, ce.designation, cd.name as department_name,
+                       cb.name as branch_name, c.name as company_name,
+                       ca.leave_type, ca.start_date, ca.end_date
+                FROM company_approval ca
+                JOIN company_employee ce ON ce.id = ca.company_employee_id
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                WHERE ce.is_deleted = '0' AND ca.media_type = 'leave' AND ca.status = 'approved'
+                AND $1 BETWEEN ca.start_date AND ca.end_date
+            """
+            params = [date]
+            query, params = _build_filtered_query(query, ctx, params, 2, company_name, branch_name)
+            query += " ORDER BY c.name, ce.employee_name"
+            on_leave_rows = fetch_all(query, params)
+
+            if status == 'on_leave':
+                result["count"] = len(on_leave_rows)
+                result["employees"] = [
+                    {**format_employee(r),
+                     "leave_type": r.get("leave_type"),
+                     "start_date": str(r.get("start_date")),
+                     "end_date": str(r.get("end_date"))}
+                    for r in on_leave_rows
+                ]
+            else:
+                result["on_leave_count"] = len(on_leave_rows)
+
+        # ABSENT employees
+        if status in ['absent', 'all']:
+            try:
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                day_abbr = DAY_ABBR_REVERSE[date_obj.weekday()]
+            except ValueError:
+                return {"error": f"Invalid date format: {date}. Use YYYY-MM-DD."}
+
+            query = """
+                SELECT ce.employee_name, ce.designation, cd.name as department_name,
+                       cb.name as branch_name, c.name as company_name
+                FROM company_employee ce
+                LEFT JOIN company_department cd ON cd.id = ce.company_role_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company c ON c.id = ce.company_id
+                WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+                  AND ce.id NOT IN (
+                      SELECT ca.company_employee_id
+                      FROM company_attendance ca
+                      WHERE ca.date = $1
+                  )
+                  AND ce.id NOT IN (
+                      SELECT cap.company_employee_id
+                      FROM company_approval cap
+                      WHERE cap.media_type = 'leave'
+                        AND cap.status = 'approved'
+                        AND $1 BETWEEN cap.start_date AND cap.end_date
+                  )
+                  AND ce.company_branch_id NOT IN (
+                      SELECT ch.company_branch_id
+                      FROM company_holiday ch
+                      WHERE ch.date = $1
+                  )
+                  AND (
+                      cb.working_day IS NULL
+                      OR cb.working_day = ''
+                      OR LOWER(cb.working_day) LIKE $2
+                  )
+            """
+            params = [date, f"%{day_abbr}%"]
+            query, params = _build_filtered_query(query, ctx, params, 3, company_name, branch_name)
+            query += " ORDER BY ce.employee_name"
+            absent_rows = fetch_all(query, params)
+
+            if status == 'absent':
+                result["count"] = len(absent_rows)
+                result["employees"] = [format_employee(r) for r in absent_rows]
+                result["_note"] = "Excludes: approved leave, holidays, non-working days"
+            else:
+                result["absent_count"] = len(absent_rows)
 
         return _add_filters_to_result(result, company_name, branch_name)
 

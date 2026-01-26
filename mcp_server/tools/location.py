@@ -246,232 +246,159 @@ def register(mcp):
         return result
 
     @mcp.tool()
-    def who_is_at_work(company_name: str = None, branch_name: str = None) -> dict:
+    def get_employees_by_location(
+        status: str = "all",
+        company_name: str = None,
+        branch_name: str = None
+    ) -> dict:
         """
-        Get list of employees who are currently at their designated work location.
+        Get employees grouped by their location status.
         Based on today's latest location update.
+
+        Status options:
+        - 'at_work': Employees at their designated work location
+        - 'outside': Employees outside work location (field staff, remote, in transit)
+        - 'offline': Employees with no location update today
+        - 'all': Summary with counts for all statuses
+
+        Use company_name and/or branch_name to filter.
         """
         ctx = get_user_context()
         if not ctx:
             return {"error": "Not authenticated. Please login first."}
 
-        # First get latest location per employee, then filter for at_work
-        query = """
-            SELECT employee_name, branch_name, location_add_time, battery_percentage
-            FROM (
+        status = status.lower().strip()
+        valid_statuses = ['at_work', 'outside', 'offline', 'all']
+        if status not in valid_statuses:
+            return {"error": f"Invalid status '{status}'. Use: {', '.join(valid_statuses)}"}
+
+        result = {"date": datetime.now().strftime("%Y-%m-%d")}
+
+        def add_filters(result):
+            if company_name:
+                result["company_filter"] = company_name
+            if branch_name:
+                result["branch_filter"] = branch_name
+            return result
+
+        def group_by_branch(rows, include_location=False):
+            branches = {}
+            for row in rows:
+                branch = row.get("branch_name") or "Unknown"
+                if branch not in branches:
+                    branches[branch] = []
+                emp_data = {
+                    "name": row.get("employee_name"),
+                    "last_update": row.get("location_add_time"),
+                    "battery": row.get("battery_percentage")
+                }
+                if include_location:
+                    emp_data["location"] = row.get("address") or row.get("city") or "Unknown"
+                    emp_data["activity"] = row.get("activity_status")
+                branches[branch].append(emp_data)
+            return branches
+
+        # Build base subquery for location data
+        def build_location_subquery():
+            params = []
+            param_idx = 1
+            subquery = """
                 SELECT DISTINCT ON (ce.id)
                        ce.id, ce.employee_name, cb.name as branch_name,
+                       lh.address, lh.city,
                        lh.location_add_time, lh.battery_percentage,
-                       lh.is_location_match, c.name as company_name
+                       lh.activity_status, lh.is_location_match
                 FROM company_employee_location_history lh
                 JOIN company_employee ce ON ce.id = lh.company_employee_id
                 LEFT JOIN company c ON c.id = ce.company_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
                 WHERE ce.is_deleted = '0' AND ce.employee_status = 3
                   AND lh.location_add_date = CURRENT_DATE
-                ORDER BY ce.id, lh.created_at DESC
-            ) latest
-            WHERE is_location_match = 1
-        """
-        params = []
-        param_idx = 1
+            """
+            if company_name:
+                subquery += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{company_name}%")
+                param_idx += 1
+            if branch_name:
+                subquery += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{branch_name}%")
+                param_idx += 1
+            subquery = apply_company_filter(ctx, subquery, "ce")
+            subquery += " ORDER BY ce.id, lh.created_at DESC"
+            return subquery, params
 
-        # Filters need to be in the subquery - rebuild query with filters
-        subquery = """
-            SELECT DISTINCT ON (ce.id)
-                   ce.id, ce.employee_name, cb.name as branch_name,
-                   lh.location_add_time, lh.battery_percentage,
-                   lh.is_location_match
-            FROM company_employee_location_history lh
-            JOIN company_employee ce ON ce.id = lh.company_employee_id
-            LEFT JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
-              AND lh.location_add_date = CURRENT_DATE
-        """
+        # AT_WORK employees
+        if status in ['at_work', 'all']:
+            subquery, params = build_location_subquery()
+            query = f"""
+                SELECT employee_name, branch_name, location_add_time, battery_percentage
+                FROM ({subquery}) latest
+                WHERE is_location_match = 1
+            """
+            rows = fetch_all(query, params) if params else fetch_all(query)
 
-        if company_name:
-            subquery += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{company_name}%")
-            param_idx += 1
+            if status == 'at_work':
+                result["count"] = len(rows)
+                result["branches"] = group_by_branch(rows)
+            else:
+                result["at_work_count"] = len(rows)
 
-        if branch_name:
-            subquery += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{branch_name}%")
-            param_idx += 1
+        # OUTSIDE employees
+        if status in ['outside', 'all']:
+            subquery, params = build_location_subquery()
+            query = f"""
+                SELECT employee_name, branch_name, address, city,
+                       location_add_time, battery_percentage, activity_status
+                FROM ({subquery}) latest
+                WHERE is_location_match = 0 OR is_location_match IS NULL
+            """
+            rows = fetch_all(query, params) if params else fetch_all(query)
 
-        subquery = apply_company_filter(ctx, subquery, "ce")
-        subquery += " ORDER BY ce.id, lh.created_at DESC"
+            if status == 'outside':
+                result["count"] = len(rows)
+                result["branches"] = group_by_branch(rows, include_location=True)
+            else:
+                result["outside_count"] = len(rows)
 
-        query = f"""
-            SELECT employee_name, branch_name, location_add_time, battery_percentage
-            FROM ({subquery}) latest
-            WHERE is_location_match = 1
-        """
+        # OFFLINE employees
+        if status in ['offline', 'all']:
+            params = []
+            param_idx = 1
+            query = """
+                SELECT ce.employee_name, cb.name as branch_name
+                FROM company_employee ce
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+                  AND ce.id NOT IN (
+                      SELECT DISTINCT lh.company_employee_id
+                      FROM company_employee_location_history lh
+                      WHERE lh.location_add_date = CURRENT_DATE
+                  )
+            """
+            if company_name:
+                query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{company_name}%")
+                param_idx += 1
+            if branch_name:
+                query += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{branch_name}%")
+                param_idx += 1
+            query = apply_company_filter(ctx, query, "ce")
+            query += " ORDER BY cb.name, ce.employee_name"
+            rows = fetch_all(query, params) if params else fetch_all(query)
 
-        rows = fetch_all(query, params) if params else fetch_all(query)
+            if status == 'offline':
+                result["count"] = len(rows)
+                branches = {}
+                for row in rows:
+                    branch = row.get("branch_name") or "Unknown"
+                    if branch not in branches:
+                        branches[branch] = []
+                    branches[branch].append(row.get("employee_name"))
+                result["branches"] = branches
+                result["_note"] = "No location update today - app may not be running"
+            else:
+                result["offline_count"] = len(rows)
 
-        # Group by branch
-        branches = {}
-        for row in rows:
-            branch = row.get("branch_name") or "Unknown"
-            if branch not in branches:
-                branches[branch] = []
-            branches[branch].append({
-                "name": row.get("employee_name"),
-                "last_update": row.get("location_add_time"),
-                "battery": row.get("battery_percentage")
-            })
-
-        result = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "count": len(rows),
-            "branches": branches
-        }
-
-        if company_name:
-            result["company_filter"] = company_name
-        if branch_name:
-            result["branch_filter"] = branch_name
-
-        return result
-
-    @mcp.tool()
-    def who_is_outside_work(company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get list of employees who are currently outside their designated work location.
-        Includes field staff, remote workers, or employees in transit.
-        """
-        ctx = get_user_context()
-        if not ctx:
-            return {"error": "Not authenticated. Please login first."}
-
-        # First get latest location per employee, then filter for outside work
-        params = []
-        param_idx = 1
-
-        subquery = """
-            SELECT DISTINCT ON (ce.id)
-                   ce.id, ce.employee_name, cb.name as branch_name,
-                   lh.address, lh.city,
-                   lh.location_add_time, lh.battery_percentage,
-                   lh.activity_status, lh.is_location_match
-            FROM company_employee_location_history lh
-            JOIN company_employee ce ON ce.id = lh.company_employee_id
-            LEFT JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
-              AND lh.location_add_date = CURRENT_DATE
-        """
-
-        if company_name:
-            subquery += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{company_name}%")
-            param_idx += 1
-
-        if branch_name:
-            subquery += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{branch_name}%")
-            param_idx += 1
-
-        subquery = apply_company_filter(ctx, subquery, "ce")
-        subquery += " ORDER BY ce.id, lh.created_at DESC"
-
-        query = f"""
-            SELECT employee_name, branch_name, address, city,
-                   location_add_time, battery_percentage, activity_status
-            FROM ({subquery}) latest
-            WHERE is_location_match = 0 OR is_location_match IS NULL
-        """
-
-        rows = fetch_all(query, params) if params else fetch_all(query)
-
-        # Group by branch
-        branches = {}
-        for row in rows:
-            branch = row.get("branch_name") or "Unknown"
-            if branch not in branches:
-                branches[branch] = []
-            branches[branch].append({
-                "name": row.get("employee_name"),
-                "location": row.get("address") or row.get("city") or "Unknown",
-                "last_update": row.get("location_add_time"),
-                "activity": row.get("activity_status"),
-                "battery": row.get("battery_percentage")
-            })
-
-        result = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "count": len(rows),
-            "branches": branches
-        }
-
-        if company_name:
-            result["company_filter"] = company_name
-        if branch_name:
-            result["branch_filter"] = branch_name
-
-        return result
-
-    @mcp.tool()
-    def who_is_offline(company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get list of employees with no location update today.
-        Could indicate app not running, phone off, or no network.
-        """
-        ctx = get_user_context()
-        if not ctx:
-            return {"error": "Not authenticated. Please login first."}
-
-        # Get employees who have NO location record today
-        query = """
-            SELECT ce.employee_name, cb.name as branch_name
-            FROM company_employee ce
-            LEFT JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            WHERE ce.is_deleted = '0' AND ce.employee_status = 3
-              AND ce.id NOT IN (
-                  SELECT DISTINCT lh.company_employee_id
-                  FROM company_employee_location_history lh
-                  WHERE lh.location_add_date = CURRENT_DATE
-              )
-        """
-        params = []
-        param_idx = 1
-
-        if company_name:
-            query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{company_name}%")
-            param_idx += 1
-
-        if branch_name:
-            query += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{branch_name}%")
-            param_idx += 1
-
-        query = apply_company_filter(ctx, query, "ce")
-        query += " ORDER BY cb.name, ce.employee_name"
-
-        rows = fetch_all(query, params) if params else fetch_all(query)
-
-        # Group by branch
-        branches = {}
-        for row in rows:
-            branch = row.get("branch_name") or "Unknown"
-            if branch not in branches:
-                branches[branch] = []
-            branches[branch].append(row.get("employee_name"))
-
-        result = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "count": len(rows),
-            "branches": branches,
-            "_note": "No location update today - app may not be running"
-        }
-
-        if company_name:
-            result["company_filter"] = company_name
-        if branch_name:
-            result["branch_filter"] = branch_name
-
-        return result
+        return add_filters(result)

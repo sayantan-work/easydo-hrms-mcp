@@ -7,16 +7,9 @@ from ..rbac import apply_company_filter
 def register(mcp):
     """Register policy tools with MCP server."""
 
-    @mcp.tool()
-    def get_leave_policy(company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get leave policy (quotas, carry forward rules) for a branch.
-        Defaults to your branch if no filters provided.
-        """
-        ctx = get_user_context()
-        if not ctx:
-            return {"error": "Not authenticated. Please login first."}
-
+    # Internal helper functions (not exposed as tools)
+    def _get_leave_policy_data(ctx, company_name: str = None, branch_name: str = None) -> dict:
+        """Internal: Get leave policy data."""
         base_select = """
             SELECT cb.name as branch_name, c.name as company_name,
                    cl.sick_leave, cl.sick_leave_max_month,
@@ -40,13 +33,11 @@ def register(mcp):
             query = base_select + " AND LOWER(cb.name) LIKE LOWER($1)"
             rows = fetch_all(query, [f"%{branch_name}%"])
         else:
-            # Default: user's current branch
             if not ctx.company_branch_id:
                 return {"error": "No branch found. Please specify branch_name."}
             query = base_select + " AND cl.company_branch_id = $1"
             rows = fetch_all(query, [ctx.company_branch_id])
 
-        # Restructure with clear explanations
         policies = []
         for row in rows:
             casual_quota = row.get("casual_leave", 0) or 0
@@ -60,23 +51,20 @@ def register(mcp):
                     "sick_leave": {
                         "annual_quota": row.get("sick_leave", 0),
                         "max_per_month": row.get("sick_leave_max_month", 0),
-                        "allocation": "upfront",
-                        "_note": "Credited at start of year"
+                        "allocation": "upfront"
                     },
                     "casual_leave": {
                         "annual_quota": casual_quota,
                         "monthly_accrual": round(casual_quota / 12, 2),
                         "max_per_month": row.get("casual_leave_max_month", 0),
                         "max_consecutive_days": row.get("max_consequently_casual_leave", 0),
-                        "allocation": "accrued",
-                        "_note": f"Accrued monthly: {round(casual_quota / 12, 2)} leaves added on 1st of each month"
+                        "allocation": "accrued"
                     },
                     "earned_leave": {
                         "annual_quota": earned_quota,
                         "monthly_accrual": round(earned_quota / 12, 2),
                         "max_per_month": row.get("earned_leave_max_month", 0),
-                        "allocation": "accrued",
-                        "_note": f"Accrued monthly: {round(earned_quota / 12, 2)} leaves added on 1st of each month"
+                        "allocation": "accrued"
                     },
                     "other_leave": {
                         "annual_quota": row.get("other_leave", 0),
@@ -85,8 +73,7 @@ def register(mcp):
                 },
                 "carry_forward": {
                     "allowed": row.get("is_carry_forward_leave_allowed") == 1,
-                    "max_days": row.get("carry_forward_leave", 0),
-                    "_note": "Max leaves you can carry from one year to the next"
+                    "max_days": row.get("carry_forward_leave", 0)
                 },
                 "holidays": row.get("holiday", 0),
                 "total_annual_paid_leave": row.get("paid_leave_year", 0)
@@ -95,22 +82,12 @@ def register(mcp):
 
         if not policies:
             return {"error": "No leave policy found"}
-
         if len(policies) == 1:
             return policies[0]
-
         return {"count": len(policies), "leave_policies": policies}
 
-    @mcp.tool()
-    def get_attendance_policy(company_name: str = None, branch_name: str = None) -> dict:
-        """
-        Get attendance policy (working hours, grace period, late rules).
-        Defaults to your branch if no filters provided.
-        """
-        ctx = get_user_context()
-        if not ctx:
-            return {"error": "Not authenticated. Please login first."}
-
+    def _get_attendance_policy_data(ctx, company_name: str = None, branch_name: str = None) -> dict:
+        """Internal: Get attendance policy data."""
         query = """
             SELECT cb.name as branch_name, c.name as company_name,
                    cb.working_hours, cb.start_time, cb.end_time,
@@ -136,7 +113,6 @@ def register(mcp):
             param_idx += 1
 
         if not branch_name and not company_name:
-            # Default to user's branch
             if not ctx.company_branch_id:
                 return {"error": "No branch found. Please specify branch_name."}
             query += f" AND cb.id = ${param_idx}"
@@ -149,9 +125,6 @@ def register(mcp):
 
         policies = []
         for row in rows:
-            working_days = row.get("working_day", "")
-            saturday_config = row.get("saturday_working_days")
-
             grace_in = float(row.get("check_in_grace_period") or 0)
             grace_out = float(row.get("check_out_grace_period") or 0)
             late_period = float(row.get("late_period") or 0)
@@ -160,20 +133,15 @@ def register(mcp):
             allowed_late = row.get("allowed_late_day") or 0
             salary_calc_type = row.get("salary_calculation_type") or "month_total_day"
 
-            # Calculate cumulative thresholds
             late_after = grace_in
             half_day_after = grace_in + late_period
             absent_after_calculated = grace_in + late_period + half_period
 
-            # Determine absent threshold - full_day_absent field has inconsistent units
-            # If full_day_absent <= 2, assume hours (convert to mins); otherwise assume minutes
-            # Also ensure absent threshold is greater than half_day threshold
             if full_day_absent > 0 and full_day_absent <= 2:
                 absent_after_mins = full_day_absent * 60
             elif full_day_absent > half_day_after:
                 absent_after_mins = full_day_absent
             else:
-                # Use calculated value if full_day_absent is invalid or too small
                 absent_after_mins = absent_after_calculated
 
             policies.append({
@@ -186,59 +154,36 @@ def register(mcp):
                     "break_time_mins": row.get("break_time"),
                 },
                 "working_days": {
-                    "days": working_days,
-                    "saturday_working": saturday_config,
-                    "_note": "Working days configuration"
+                    "days": row.get("working_day", ""),
+                    "saturday_working": row.get("saturday_working_days")
                 },
                 "check_in_rules": {
                     "grace_period_mins": grace_in,
                     "late_after_mins": late_after,
                     "half_day_after_mins": half_day_after,
-                    "absent_after_mins": absent_after_mins,
-                    "_timeline": f"0-{int(grace_in)}: On Time | {int(grace_in)}-{int(half_day_after)}: Late | {int(half_day_after)}-{int(absent_after_mins)}: Half Day | >{int(absent_after_mins)}: Absent"
+                    "absent_after_mins": absent_after_mins
                 },
                 "check_out_rules": {
-                    "grace_period_mins": grace_out,
-                    "_note": f"Can leave {grace_out} mins before end time without penalty"
+                    "grace_period_mins": grace_out
                 },
                 "late_deduction_policy": {
                     "allowed_late_days": allowed_late,
-                    "lates_per_absent_deduction": allowed_late if allowed_late > 0 else None,
-                    "formula": f"floor(Late Days / {allowed_late}) x Daily Rate" if allowed_late > 0 else "No late deduction policy",
-                    "_note": f"Every {allowed_late}th late = 1 absent deduction (1-{allowed_late - 1} lates: 0, {allowed_late} lates: 1, {allowed_late * 2} lates: 2)" if allowed_late > 0 else "Late days do not result in salary deduction"
-                },
-                "half_day_deduction": {
-                    "formula": "Half Days x 0.5 x Daily Rate",
-                    "_note": "Each half day deducts 50% of daily rate"
+                    "lates_per_absent_deduction": allowed_late if allowed_late > 0 else None
                 },
                 "salary_calculation": {
                     "type": salary_calc_type,
-                    "daily_rate_basis": "calendar_days" if salary_calc_type == "month_total_day" else "working_days",
-                    "formula": "Gross Salary / Calendar Days in Month" if salary_calc_type == "month_total_day" else "Gross Salary / Working Days in Month",
-                    "_note": "Daily rate calculation method for deductions"
+                    "daily_rate_basis": "calendar_days" if salary_calc_type == "month_total_day" else "working_days"
                 },
-                "other": {
-                    "probation_period_months": row.get("probation_period"),
-                    "is_shift_rotational": row.get("is_shift_rotational") == 1
-                }
+                "probation_period_months": row.get("probation_period"),
+                "is_shift_rotational": row.get("is_shift_rotational") == 1
             })
 
         if len(policies) == 1:
             return policies[0]
-
         return {"count": len(policies), "attendance_policies": policies}
 
-    @mcp.tool()
-    def get_statutory_rules() -> dict:
-        """
-        Get statutory rules (PF, ESI percentages, tax slabs).
-        These are government-mandated rules, not company-specific.
-        """
-        ctx = get_user_context()
-        if not ctx:
-            return {"error": "Not authenticated. Please login first."}
-
-        # Get latest statutory rules
+    def _get_statutory_rules_data() -> dict:
+        """Internal: Get statutory rules data."""
         rules_query = """
             SELECT sr.financial_year, sr.epf_present as epf_percentage,
                    sr.esi_present as esi_percentage, sr.esi_min_amount, sr.esi_max_amount, sr.nps_min
@@ -248,7 +193,6 @@ def register(mcp):
         """
         rules = fetch_one(rules_query)
 
-        # Get tax slabs
         tax_query = """
             SELECT ts.start_amount, ts.end_amount, ts.total_tax as tax_percentage
             FROM tax_slabs ts ORDER BY ts.start_amount
@@ -258,5 +202,58 @@ def register(mcp):
         return {
             "statutory_rules": rules if rules else {},
             "tax_slabs": tax_slabs,
-            "_note": "These are government-mandated statutory deduction rates"
+            "_note": "Government-mandated statutory deduction rates"
         }
+
+    @mcp.tool()
+    def get_policy(
+        policy_type: str = "all",
+        company_name: str = None,
+        branch_name: str = None
+    ) -> dict:
+        """
+        Get company/branch policies.
+
+        Policy type options:
+        - 'leave': Leave quotas, carry forward rules
+        - 'attendance': Working hours, grace period, late rules
+        - 'statutory': PF, ESI percentages, tax slabs (government-mandated)
+        - 'all': All policies combined
+
+        Use company_name and/or branch_name to filter (defaults to your branch).
+        """
+        ctx = get_user_context()
+        if not ctx:
+            return {"error": "Not authenticated. Please login first."}
+
+        policy_type = policy_type.lower().strip()
+        valid_types = ['leave', 'attendance', 'statutory', 'all']
+        if policy_type not in valid_types:
+            return {"error": f"Invalid policy_type '{policy_type}'. Use: {', '.join(valid_types)}"}
+
+        result = {}
+
+        if policy_type == 'leave':
+            return _get_leave_policy_data(ctx, company_name, branch_name)
+        elif policy_type == 'attendance':
+            return _get_attendance_policy_data(ctx, company_name, branch_name)
+        elif policy_type == 'statutory':
+            return _get_statutory_rules_data()
+        else:  # all
+            leave_data = _get_leave_policy_data(ctx, company_name, branch_name)
+            attendance_data = _get_attendance_policy_data(ctx, company_name, branch_name)
+            statutory_data = _get_statutory_rules_data()
+
+            result = {
+                "leave_policy": leave_data if "error" not in leave_data else None,
+                "attendance_policy": attendance_data if "error" not in attendance_data else None,
+                "statutory_rules": statutory_data
+            }
+
+            # Add filter info
+            if company_name:
+                result["company_filter"] = company_name
+            if branch_name:
+                result["branch_filter"] = branch_name
+
+            return result

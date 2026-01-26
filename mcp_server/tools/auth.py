@@ -343,44 +343,6 @@ def register(mcp):
         return {"success": True, "message": "Already logged out."}
 
     @mcp.tool()
-    def status() -> dict:
-        """Check if MCP is authenticated and ready to use."""
-        if not os.path.exists(CREDENTIALS_FILE):
-            return {
-                "authenticated": False,
-                "status": "NOT_AUTHENTICATED",
-                "message": "Not logged in. Use login(phone, environment) to authenticate.",
-                "hint": "Example: login('98XXXXXXXX', 'prod') or login('98XXXXXXXX', 'staging')",
-            }
-
-        try:
-            with open(CREDENTIALS_FILE, "r") as f:
-                creds = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {
-                "authenticated": False,
-                "status": "CORRUPTED_CREDENTIALS",
-                "message": "Credentials file is corrupted. Please login again.",
-            }
-
-        if not creds.get("user_id"):
-            return {
-                "authenticated": False,
-                "status": "INVALID_CREDENTIALS",
-                "message": "Credentials file exists but is invalid. Please login again.",
-            }
-
-        env = creds.get("environment", "prod")
-        return {
-            "authenticated": True,
-            "status": "READY",
-            "user_id": creds.get("user_id"),
-            "user_name": creds.get("user_name"),
-            "environment": env,
-            "message": f"Authenticated as {creds.get('user_name')} on {env.upper()}. Ready to use.",
-        }
-
-    @mcp.tool()
     def whoami() -> dict:
         """Check current login status and show user info."""
         ctx = get_user_context()

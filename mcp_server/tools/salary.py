@@ -8,15 +8,105 @@ def register(mcp):
     """Register salary tools with MCP server."""
 
     @mcp.tool()
-    def get_salary(employee_name: str = None, company_name: str = None) -> dict:
+    def get_salary(employee_name: str = None, company_name: str = None, branch_name: str = None, list_all: bool = False) -> dict:
         """
         Get current salary details including basic pay, allowances, and deductions.
-        If employee_name is not provided, returns your own salary.
-        Use company_name to filter by specific company.
+
+        Usage modes:
+        - No params: Returns your own salary
+        - employee_name: Returns specific employee's salary
+        - company_name + list_all=True: Returns all salaries in that company (sorted by net salary desc)
+        - branch_name + list_all=True: Returns all salaries in that branch
+        - company_name/branch_name without list_all: Returns your salary filtered by company/branch
+
+        Use list_all=True with company_name or branch_name to get salary list for analytics.
         """
         ctx = get_user_context()
         if not ctx:
             return {"error": "Not authenticated. Please login first."}
+
+        # Mode: List all salaries for company/branch
+        if list_all and (company_name or branch_name):
+            query = """
+                SELECT ce.employee_name, ce.designation, c.name as company_name,
+                       cb.name as branch_name, ce.basic_salary,
+                       cea.house_rent_allowance, cea.dearness_allowance, cea.travel_allowance,
+                       cea.conveyance_allowance, cea.medical_allowance, cea.special_allowance,
+                       cea.bonus_allowance,
+                       ced.provident_fund, ced.esi, ced.professional_tax, ced.tds,
+                       ced.national_pension_system
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_employee_allowance cea ON cea.company_employee_id = ce.id AND cea.is_current = 1
+                LEFT JOIN company_employee_deduction ced ON ced.company_employee_id = ce.id AND ced.is_current = 1
+                WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+            """
+            params = []
+            param_idx = 1
+
+            if company_name:
+                query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{company_name}%")
+                param_idx += 1
+
+            if branch_name:
+                query += f" AND LOWER(cb.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{branch_name}%")
+                param_idx += 1
+
+            query = apply_company_filter(ctx, query, "ce")
+            query += " ORDER BY ce.basic_salary DESC NULLS LAST"
+            rows = fetch_all(query, params)
+
+            if not rows:
+                return {"error": "No employees found with the given filters"}
+
+            # Calculate net salary for each employee
+            salaries = []
+            for row in rows:
+                basic = row.get("basic_salary") or 0
+                hra = row.get("house_rent_allowance") or 0
+                da = row.get("dearness_allowance") or 0
+                ta = row.get("travel_allowance") or 0
+                ca = row.get("conveyance_allowance") or 0
+                ma = row.get("medical_allowance") or 0
+                sa = row.get("special_allowance") or 0
+                ba = row.get("bonus_allowance") or 0
+                gross = basic + hra + da + ta + ca + ma + sa + ba
+
+                pf = row.get("provident_fund") or 0
+                esi = row.get("esi") or 0
+                pt = row.get("professional_tax") or 0
+                tds = row.get("tds") or 0
+                nps = row.get("national_pension_system") or 0
+                total_ded = pf + esi + pt + tds + nps
+                net = gross - total_ded
+
+                salaries.append({
+                    "employee_name": row.get("employee_name"),
+                    "designation": row.get("designation"),
+                    "branch": row.get("branch_name"),
+                    "company": row.get("company_name"),
+                    "gross_salary": gross,
+                    "total_deductions": total_ded,
+                    "net_salary": net
+                })
+
+            # Sort by net salary descending
+            salaries.sort(key=lambda x: x["net_salary"], reverse=True)
+
+            result = {
+                "count": len(salaries),
+                "salaries": salaries,
+                "highest_earner": salaries[0] if salaries else None,
+                "lowest_earner": salaries[-1] if salaries else None
+            }
+            if company_name:
+                result["company_filter"] = company_name
+            if branch_name:
+                result["branch_filter"] = branch_name
+            return result
 
         if employee_name:
             # Search for the employee

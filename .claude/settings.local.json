@@ -1,6 +1,11 @@
 {
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "easydo-hrms"
   ],
-  "enableAllProjectMcpServers": true
+  "permissions": {
+    "allow": [
+      "mcp__easydo-hrms__get_daily_attendance"
+    ]
+  }
 }

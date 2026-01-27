@@ -112,10 +112,28 @@ def _build_leave_balance(row: dict) -> dict:
 
 
 # Employee lookup helpers
-def _search_employee_for_leave(ctx, employee_name: str, company_name: str = None):
+def _search_employee_for_leave(ctx, employee_name: str = None, company_name: str = None, employee_id: int = None):
     """Search for employee with leave balance data."""
+    # If employee_id is provided, use it directly
+    if employee_id:
+        query = """
+            SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name,
+                   cel.earned_leave, cel.casual_leave, cel.sick_leave,
+                   cel.other_leave, cel.carry_forward_leave, cel.year,
+                   ce.company_branch_id
+            FROM company_employee ce
+            JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            LEFT JOIN company_employee_leave cel ON cel.company_employee_id = ce.id AND cel.is_current = 1
+            WHERE ce.is_deleted = '0' AND ce.id = $1
+        """
+        query = apply_company_filter(ctx, query, "ce")
+        rows = fetch_all(query, [employee_id])
+        return rows
+
+    # Search by name
     query = """
-        SELECT ce.id, ce.employee_name, c.name as company_name, cb.name as branch_name,
+        SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name,
                cel.earned_leave, cel.casual_leave, cel.sick_leave,
                cel.other_leave, cel.carry_forward_leave, cel.year,
                ce.company_branch_id
@@ -160,12 +178,27 @@ def _get_self_leave_balance(ctx):
     return row, pc.company_branch_id, None
 
 
-def _search_employee_basic(ctx, employee_name: str, company_name: str = None):
+def _search_employee_basic(ctx, employee_name: str = None, company_name: str = None, employee_id: int = None):
     """Search for basic employee info."""
+    # If employee_id is provided, use it directly
+    if employee_id:
+        query = """
+            SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
+            FROM company_employee ce
+            JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            WHERE ce.id = $1 AND ce.is_deleted = '0'
+        """
+        query = apply_company_filter(ctx, query, "ce")
+        rows = fetch_all(query, [employee_id])
+        return rows
+
+    # Search by name
     query = """
-        SELECT ce.id, ce.employee_name, c.name as company_name
+        SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
         FROM company_employee ce
         JOIN company c ON c.id = ce.company_id
+        LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
         WHERE LOWER(ce.employee_name) LIKE LOWER($1) AND ce.is_deleted = '0'
     """
     params = [f"%{employee_name}%"]
@@ -196,7 +229,7 @@ def register(mcp):
     """Register leave tools with MCP server."""
 
     @mcp.tool()
-    def get_leave_balance(employee_name: str = None, company_name: str = None) -> dict:
+    def get_leave_balance(employee_name: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get leave balance for an employee.
         If employee_name is not provided, returns your own leave balance.
@@ -206,16 +239,34 @@ def register(mcp):
         if err:
             return err
 
-        if employee_name:
-            rows = _search_employee_for_leave(ctx, employee_name, company_name)
+        if employee_id:
+            rows = _search_employee_for_leave(ctx, employee_id=employee_id)
+
+            if not rows:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+            row = rows[0]
+            branch_id = row.get("company_branch_id")
+
+        elif employee_name:
+            rows = _search_employee_for_leave(ctx, employee_name=employee_name, company_name=company_name)
 
             if not rows:
                 return {"error": f"Employee '{employee_name}' not found or no leave balance data"}
 
-            if len(rows) > 1 and not company_name:
+            if len(rows) > 1:
                 return {
-                    "error": "Multiple employees found. Please specify company_name.",
-                    "matches": [{"employee_name": r["employee_name"], "company_name": r["company_name"]} for r in rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in rows
+                    ]
                 }
 
             row = rows[0]
@@ -240,7 +291,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_leave_history(employee_name: str = None, year: int = None, company_name: str = None) -> dict:
+    def get_leave_history(employee_name: str = None, year: int = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get leave history showing all leave requests with dates and status.
         If employee_name is not provided, returns your own leave history.
@@ -253,16 +304,35 @@ def register(mcp):
         if not year:
             year = datetime.now().year
 
-        if employee_name:
-            emp_rows = _search_employee_basic(ctx, employee_name, company_name)
+        if employee_id:
+            emp_rows = _search_employee_basic(ctx, employee_id=employee_id)
+
+            if not emp_rows:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+            target_emp_id = emp_rows[0]["id"]
+            target_name = emp_rows[0]["employee_name"]
+            target_company = emp_rows[0]["company_name"]
+
+        elif employee_name:
+            emp_rows = _search_employee_basic(ctx, employee_name=employee_name, company_name=company_name)
 
             if not emp_rows:
                 return {"error": f"Employee '{employee_name}' not found or not accessible"}
 
-            if len(emp_rows) > 1 and not company_name:
+            if len(emp_rows) > 1:
                 return {
-                    "error": "Multiple employees found. Please specify company_name.",
-                    "matches": [{"employee_name": r["employee_name"], "company_name": r["company_name"]} for r in emp_rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in emp_rows
+                    ]
                 }
 
             target_emp_id = emp_rows[0]["id"]

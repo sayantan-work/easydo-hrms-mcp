@@ -9,7 +9,7 @@ def register(mcp):
     """Register location tracking tools with MCP server."""
 
     @mcp.tool()
-    def get_employee_location(employee_name: str = None, company_name: str = None) -> dict:
+    def get_employee_location(employee_name: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get current/last known location of an employee.
         If employee_name is not provided, returns your own location.
@@ -34,7 +34,44 @@ def register(mcp):
         params = []
         param_idx = 1
 
-        if employee_name:
+        # Priority: employee_id > employee_name > self
+        if employee_id:
+            query += f" AND ce.id = ${param_idx}"
+            params.append(employee_id)
+            param_idx += 1
+        elif employee_name:
+            # First check if multiple employees match
+            check_query = """
+                SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0' AND LOWER(ce.employee_name) LIKE LOWER($1)
+            """
+            check_params = [f"%{employee_name}%"]
+            if company_name:
+                check_query += " AND LOWER(c.name) LIKE LOWER($2)"
+                check_params.append(f"%{company_name}%")
+            check_query = apply_company_filter(ctx, check_query, "ce")
+            check_rows = fetch_all(check_query, check_params)
+
+            if not check_rows:
+                return {"error": f"Employee '{employee_name}' not found"}
+            if len(check_rows) > 1:
+                return {
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in check_rows
+                    ]
+                }
+
             query += f" AND LOWER(ce.employee_name) LIKE LOWER(${param_idx})"
             params.append(f"%{employee_name}%")
             param_idx += 1
@@ -43,7 +80,7 @@ def register(mcp):
             params.append(ctx.primary_company.company_employee_id)
             param_idx += 1
 
-        if company_name:
+        if company_name and not employee_id:
             query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
             params.append(f"%{company_name}%")
             param_idx += 1
@@ -84,7 +121,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_location_history(employee_name: str, date: str = None, company_name: str = None) -> dict:
+    def get_location_history(employee_name: str = None, date: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get location trail/history for an employee on a specific date.
         Date format: YYYY-MM-DD (defaults to today).
@@ -96,36 +133,96 @@ def register(mcp):
         if not date:
             date = datetime.now().strftime("%Y-%m-%d")
 
-        query = """
-            SELECT ce.employee_name, cb.name as branch_name,
-                   lh.address, lh.city, lh.state,
-                   lh.latitude, lh.longitude,
-                   lh.location_add_time,
-                   lh.is_location_match, lh.battery_percentage,
-                   lh.activity_status, lh.distance
-            FROM company_employee_location_history lh
-            JOIN company_employee ce ON ce.id = lh.company_employee_id
-            LEFT JOIN company c ON c.id = ce.company_id
-            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            WHERE ce.is_deleted = '0'
-              AND LOWER(ce.employee_name) LIKE LOWER($1)
-              AND lh.location_add_date = $2
-        """
-        params = [f"%{employee_name}%", date]
-        param_idx = 3
+        # Need either employee_id or employee_name
+        if not employee_id and not employee_name:
+            return {"error": "Please provide either employee_name or employee_id"}
 
-        if company_name:
-            query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
-            params.append(f"%{company_name}%")
-            param_idx += 1
+        # If employee_id provided, use it directly
+        if employee_id:
+            query = """
+                SELECT ce.employee_name, cb.name as branch_name,
+                       lh.address, lh.city, lh.state,
+                       lh.latitude, lh.longitude,
+                       lh.location_add_time,
+                       lh.is_location_match, lh.battery_percentage,
+                       lh.activity_status, lh.distance
+                FROM company_employee_location_history lh
+                JOIN company_employee ce ON ce.id = lh.company_employee_id
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0'
+                  AND ce.id = $1
+                  AND lh.location_add_date = $2
+            """
+            query = apply_company_filter(ctx, query, "ce")
+            query += " ORDER BY lh.location_time ASC"
+            rows = fetch_all(query, [employee_id, date])
 
-        query = apply_company_filter(ctx, query, "ce")
-        query += " ORDER BY lh.location_time ASC"
+            if not rows:
+                return {"error": f"No location history found for employee ID {employee_id} on {date}"}
+        else:
+            # Check for multiple matches first
+            check_query = """
+                SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0' AND LOWER(ce.employee_name) LIKE LOWER($1)
+            """
+            check_params = [f"%{employee_name}%"]
+            if company_name:
+                check_query += " AND LOWER(c.name) LIKE LOWER($2)"
+                check_params.append(f"%{company_name}%")
+            check_query = apply_company_filter(ctx, check_query, "ce")
+            check_rows = fetch_all(check_query, check_params)
 
-        rows = fetch_all(query, params)
+            if not check_rows:
+                return {"error": f"Employee '{employee_name}' not found"}
+            if len(check_rows) > 1:
+                return {
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in check_rows
+                    ]
+                }
 
-        if not rows:
-            return {"error": f"No location history found for '{employee_name}' on {date}"}
+            query = """
+                SELECT ce.employee_name, cb.name as branch_name,
+                       lh.address, lh.city, lh.state,
+                       lh.latitude, lh.longitude,
+                       lh.location_add_time,
+                       lh.is_location_match, lh.battery_percentage,
+                       lh.activity_status, lh.distance
+                FROM company_employee_location_history lh
+                JOIN company_employee ce ON ce.id = lh.company_employee_id
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0'
+                  AND LOWER(ce.employee_name) LIKE LOWER($1)
+                  AND lh.location_add_date = $2
+            """
+            params = [f"%{employee_name}%", date]
+            param_idx = 3
+
+            if company_name:
+                query += f" AND LOWER(c.name) LIKE LOWER(${param_idx})"
+                params.append(f"%{company_name}%")
+                param_idx += 1
+
+            query = apply_company_filter(ctx, query, "ce")
+            query += " ORDER BY lh.location_time ASC"
+
+            rows = fetch_all(query, params)
+
+            if not rows:
+                return {"error": f"No location history found for '{employee_name}' on {date}"}
 
         # Build location trail
         trail = []

@@ -8,13 +8,13 @@ def register(mcp):
     """Register salary tools with MCP server."""
 
     @mcp.tool()
-    def get_salary(employee_name: str = None, company_name: str = None, branch_name: str = None, list_all: bool = False) -> dict:
+    def get_salary(employee_name: str = None, company_name: str = None, branch_name: str = None, list_all: bool = False, employee_id: int = None) -> dict:
         """
         Get current salary details including basic pay, allowances, and deductions.
 
         Usage modes:
         - No params: Returns your own salary
-        - employee_name: Returns specific employee's salary
+        - employee_name or employee_id: Returns specific employee's salary
         - company_name + list_all=True: Returns all salaries in that company (sorted by net salary desc)
         - branch_name + list_all=True: Returns all salaries in that branch
         - company_name/branch_name without list_all: Returns your salary filtered by company/branch
@@ -108,8 +108,31 @@ def register(mcp):
                 result["branch_filter"] = branch_name
             return result
 
-        if employee_name:
-            # Search for the employee
+        # If employee_id is provided, use it directly
+        if employee_id:
+            query = """
+                SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name,
+                       cb.name as branch_name, ce.basic_salary,
+                       cea.house_rent_allowance, cea.dearness_allowance, cea.travel_allowance,
+                       cea.conveyance_allowance, cea.medical_allowance, cea.special_allowance,
+                       cea.bonus_allowance,
+                       ced.provident_fund, ced.esi, ced.professional_tax, ced.tds,
+                       ced.national_pension_system
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN company_employee_allowance cea ON cea.company_employee_id = ce.id AND cea.is_current = 1
+                LEFT JOIN company_employee_deduction ced ON ced.company_employee_id = ce.id AND ced.is_current = 1
+                WHERE ce.is_deleted = '0' AND ce.id = $1
+            """
+            query = apply_company_filter(ctx, query, "ce")
+            row = fetch_one(query, [employee_id])
+
+            if not row:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+        elif employee_name:
+            # Search for the employee by name
             query = """
                 SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name,
                        cb.name as branch_name, ce.basic_salary,
@@ -137,10 +160,19 @@ def register(mcp):
             if not rows:
                 return {"error": f"Employee '{employee_name}' not found or you don't have permission to view this data"}
 
-            if len(rows) > 1 and not company_name:
+            if len(rows) > 1:
                 return {
-                    "error": "Multiple employees found. Please specify company_name.",
-                    "matches": [{"employee_name": r["employee_name"], "company_name": r["company_name"], "designation": r["designation"]} for r in rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in rows
+                    ]
                 }
 
             row = rows[0]
@@ -218,7 +250,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_salary_slip(employee_name: str = None, month: str = None, company_name: str = None) -> dict:
+    def get_salary_slip(employee_name: str = None, month: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get monthly salary slip.
         If employee_name is not provided, returns your own salary slip.
@@ -245,8 +277,8 @@ def register(mcp):
         except:
             days_in_month = 30  # fallback
 
-        if employee_name:
-            # Search for the employee
+        # If employee_id is provided, use it directly
+        if employee_id:
             query = """
                 SELECT ss.employee_name, ss.company_name, ss.designation,
                        ss.from_date, ss.to_date, ss.date as slip_date,
@@ -262,6 +294,36 @@ def register(mcp):
                        ss.this_month_paid_leave_taken, ss.unpaid_leave_taken,
                        cb.allowed_late_day, cb.salary_calculation_type,
                        ce.date_of_joining
+                FROM company_employee_salary_slip ss
+                JOIN company_employee ce ON ce.id = ss.company_employee_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.id = $1
+                  AND TO_CHAR(ss.date, 'YYYY-MM') = $2
+                  AND ss.status = 1 AND ce.is_deleted = '0'
+            """
+            query = apply_company_filter(ctx, query, "ss")
+            row = fetch_one(query, [employee_id, month])
+
+            if not row:
+                return {"error": f"No salary slip found for employee ID {employee_id} in {month}"}
+
+        elif employee_name:
+            # Search for the employee by name
+            query = """
+                SELECT ss.employee_name, ss.company_name, ss.designation,
+                       ss.from_date, ss.to_date, ss.date as slip_date,
+                       ss.basic_salary, ss.house_rent_allowance, ss.dearness_allowance,
+                       ss.bonus_allowance, ss.travel_allowance, ss.conveyance_allowance,
+                       ss.medical_allowance, ss.special_allowance, ss.overtime_allowance,
+                       ss.provident_fund, ss.esi, ss.professional_tax, ss.tds,
+                       ss.national_pension_system, ss.advance_salary_installment,
+                       ss.total_allowance, ss.total_deduction,
+                       ss.gross_salary, ss.net_pay_amount, ss.net_pay_amount_in_words,
+                       ss.day_in_month, ss.working_day_in_month, ss.present, ss.absent,
+                       ss.half_day, ss.late_day, ss.holiday, ss.week_off_day,
+                       ss.this_month_paid_leave_taken, ss.unpaid_leave_taken,
+                       cb.allowed_late_day, cb.salary_calculation_type,
+                       ce.date_of_joining, ce.id as employee_id
                 FROM company_employee_salary_slip ss
                 JOIN company_employee ce ON ce.id = ss.company_employee_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
@@ -281,10 +343,18 @@ def register(mcp):
             if not rows:
                 return {"error": f"No salary slip found for {employee_name} in {month}"}
 
-            if len(rows) > 1 and not company_name:
+            if len(rows) > 1:
                 return {
-                    "error": "Multiple salary slips found. Please specify company_name.",
-                    "matches": [{"employee_name": r["employee_name"], "company_name": r["company_name"]} for r in rows]
+                    "error": "Multiple salary slips found. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r.get("employee_id"),
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"]
+                        } for r in rows
+                    ]
                 }
 
             row = rows[0]

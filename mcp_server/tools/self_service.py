@@ -9,7 +9,7 @@ def register(mcp):
     """Register self-service tools with MCP server."""
 
     @mcp.tool()
-    def get_my_documents(employee_name: str = None, company_name: str = None) -> dict:
+    def get_my_documents(employee_name: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get list of documents for an employee.
         If employee_name is not provided, returns your own documents.
@@ -19,9 +19,27 @@ def register(mcp):
         if not ctx:
             return {"error": "Not authenticated. Please login first."}
 
-        if employee_name:
+        if employee_id:
             emp_query = """
-                SELECT ce.id, ce.user_id, ce.employee_name, c.name as company_name, cb.name as branch_name
+                SELECT ce.id, ce.user_id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.id = $1 AND ce.is_deleted = '0'
+            """
+            emp_query = apply_company_filter(ctx, emp_query, "ce")
+            emp_rows = fetch_all(emp_query, [employee_id])
+
+            if not emp_rows:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+            target_user_id = emp_rows[0]["user_id"]
+            target_name = emp_rows[0]["employee_name"]
+            target_company = emp_rows[0]["company_name"]
+
+        elif employee_name:
+            emp_query = """
+                SELECT ce.id, ce.user_id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
                 FROM company_employee ce
                 JOIN company c ON c.id = ce.company_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
@@ -37,10 +55,19 @@ def register(mcp):
 
             if not emp_rows:
                 return {"error": f"Employee '{employee_name}' not found"}
-            if len(emp_rows) > 1 and not company_name:
+            if len(emp_rows) > 1:
                 return {
-                    "error": "Multiple employees found. Specify company_name.",
-                    "matches": [{"name": r["employee_name"], "company": r["company_name"]} for r in emp_rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in emp_rows
+                    ]
                 }
 
             target_user_id = emp_rows[0]["user_id"]
@@ -80,7 +107,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_my_manager(employee_name: str = None, company_name: str = None) -> dict:
+    def get_my_manager(employee_name: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get reporting manager details for an employee.
         If employee_name is not provided, returns your own manager.
@@ -90,9 +117,26 @@ def register(mcp):
         if not ctx:
             return {"error": "Not authenticated. Please login first."}
 
-        if employee_name:
+        if employee_id:
             emp_query = """
-                SELECT ce.id, ce.employee_name, ce.reporting_manager_id,
+                SELECT ce.id, ce.employee_name, ce.designation, ce.reporting_manager_id,
+                       c.name as company_name, cb.name as branch_name
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.id = $1 AND ce.is_deleted = '0'
+            """
+            emp_query = apply_company_filter(ctx, emp_query, "ce")
+            emp_rows = fetch_all(emp_query, [employee_id])
+
+            if not emp_rows:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+            target_emp = emp_rows[0]
+
+        elif employee_name:
+            emp_query = """
+                SELECT ce.id, ce.employee_name, ce.designation, ce.reporting_manager_id,
                        c.name as company_name, cb.name as branch_name
                 FROM company_employee ce
                 JOIN company c ON c.id = ce.company_id
@@ -109,10 +153,19 @@ def register(mcp):
 
             if not emp_rows:
                 return {"error": f"Employee '{employee_name}' not found"}
-            if len(emp_rows) > 1 and not company_name:
+            if len(emp_rows) > 1:
                 return {
-                    "error": "Multiple employees found. Specify company_name.",
-                    "matches": [{"name": r["employee_name"], "company": r["company_name"]} for r in emp_rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in emp_rows
+                    ]
                 }
 
             target_emp = emp_rows[0]
@@ -319,7 +372,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_my_payslips(employee_name: str = None, year: int = None, company_name: str = None) -> dict:
+    def get_my_payslips(employee_name: str = None, year: int = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get list of all salary slips for an employee.
         If employee_name is not provided, returns your own payslips.
@@ -332,9 +385,27 @@ def register(mcp):
         if not year:
             year = datetime.now().year
 
-        if employee_name:
+        if employee_id:
             emp_query = """
-                SELECT ce.id, ce.employee_name, c.name as company_name, cb.name as branch_name
+                SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
+                FROM company_employee ce
+                JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.id = $1 AND ce.is_deleted = '0'
+            """
+            emp_query = apply_company_filter(ctx, emp_query, "ce")
+            emp_rows = fetch_all(emp_query, [employee_id])
+
+            if not emp_rows:
+                return {"error": f"Employee ID {employee_id} not found or not accessible"}
+
+            target_emp_id = emp_rows[0]["id"]
+            target_name = emp_rows[0]["employee_name"]
+            target_company = emp_rows[0]["company_name"]
+
+        elif employee_name:
+            emp_query = """
+                SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name, cb.name as branch_name
                 FROM company_employee ce
                 JOIN company c ON c.id = ce.company_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
@@ -350,10 +421,19 @@ def register(mcp):
 
             if not emp_rows:
                 return {"error": f"Employee '{employee_name}' not found"}
-            if len(emp_rows) > 1 and not company_name:
+            if len(emp_rows) > 1:
                 return {
-                    "error": "Multiple employees found. Specify company_name.",
-                    "matches": [{"name": r["employee_name"], "company": r["company_name"]} for r in emp_rows]
+                    "error": "Multiple employees found with this name. Use employee_id to specify.",
+                    "hint": "Use employee_id parameter for exact match",
+                    "matches": [
+                        {
+                            "employee_id": r["id"],
+                            "employee_name": r["employee_name"],
+                            "designation": r.get("designation"),
+                            "company_name": r["company_name"],
+                            "branch_name": r.get("branch_name")
+                        } for r in emp_rows
+                    ]
                 }
 
             target_emp_id = emp_rows[0]["id"]

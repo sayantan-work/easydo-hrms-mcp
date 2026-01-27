@@ -104,14 +104,35 @@ def _parse_working_days(config: str | None) -> set:
     return working_days if working_days else DEFAULT_WORKING_DAYS
 
 
-def _resolve_employee(ctx, employee_name: str = None, company_name: str = None):
+def _resolve_employee(ctx, employee_name: str = None, company_name: str = None, employee_id: int = None):
     """
-    Resolve employee by name or default to self.
+    Resolve employee by ID, name, or default to self.
     Returns (emp_id, emp_name, company_name, branch_name, branch_id, error).
+
+    Priority: employee_id > employee_name > self
+    When multiple employees match a name, returns error with IDs for disambiguation.
     """
+    # If employee_id is provided, use it directly (with RBAC validation)
+    if employee_id:
+        query = """
+            SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name,
+                   cb.name as branch_name, cb.id as branch_id
+            FROM company_employee ce
+            JOIN company c ON c.id = ce.company_id
+            LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+            WHERE ce.id = $1 AND ce.is_deleted = '0'
+        """
+        query = apply_company_filter(ctx, query, "ce")
+        row = fetch_one(query, [employee_id])
+
+        if not row:
+            return None, None, None, None, None, {"error": f"Employee ID {employee_id} not found or not accessible"}
+        return row["id"], row["employee_name"], row["company_name"], row["branch_name"], row.get("branch_id"), None
+
+    # If employee_name is provided, search by name
     if employee_name:
         query = """
-            SELECT ce.id, ce.employee_name, c.name as company_name,
+            SELECT ce.id, ce.employee_name, ce.designation, c.name as company_name,
                    cb.name as branch_name, cb.id as branch_id
             FROM company_employee ce
             JOIN company c ON c.id = ce.company_id
@@ -128,10 +149,19 @@ def _resolve_employee(ctx, employee_name: str = None, company_name: str = None):
 
         if not rows:
             return None, None, None, None, None, {"error": f"Employee '{employee_name}' not found"}
-        if len(rows) > 1 and not company_name:
+        if len(rows) > 1:
             return None, None, None, None, None, {
-                "error": "Multiple employees found. Specify company_name.",
-                "matches": [{"name": r["employee_name"], "company": r["company_name"]} for r in rows]
+                "error": "Multiple employees found with this name. Use employee_id to specify.",
+                "hint": "Use employee_id parameter for exact match",
+                "matches": [
+                    {
+                        "employee_id": r["id"],
+                        "employee_name": r["employee_name"],
+                        "designation": r.get("designation"),
+                        "company_name": r["company_name"],
+                        "branch_name": r.get("branch_name")
+                    } for r in rows
+                ]
             }
 
         row = rows[0]
@@ -218,7 +248,7 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_punch_history(employee_name: str = None, date: str = None, company_name: str = None) -> dict:
+    def get_punch_history(employee_name: str = None, date: str = None, company_name: str = None, employee_id: int = None) -> dict:
         """
         Get detailed punch in/out history for an employee.
         Date format: YYYY-MM-DD (defaults to today).
@@ -231,7 +261,7 @@ def register(mcp):
         if not date:
             date = _today_str()
 
-        emp_id, emp_name, comp_name, branch_name, _, error = _resolve_employee(ctx, employee_name, company_name)
+        emp_id, emp_name, comp_name, branch_name, _, error = _resolve_employee(ctx, employee_name, company_name, employee_id)
         if error:
             return error
 
@@ -319,7 +349,7 @@ def register(mcp):
         return result
 
     @mcp.tool()
-    def get_attendance(employee_name: str = None, month: str = None, company_name: str = None, detailed: bool = False) -> dict:
+    def get_attendance(employee_name: str = None, month: str = None, company_name: str = None, detailed: bool = False, employee_id: int = None) -> dict:
         """
         Get monthly attendance summary for an employee.
         If employee_name is not provided, returns your own attendance.
@@ -342,7 +372,7 @@ def register(mcp):
             return {"error": f"Invalid month format: {month}. Use YYYY-MM format."}
 
         # Resolve employee with extended info
-        emp_id, emp_name, comp_name, branch_name, branch_id, error = _resolve_employee(ctx, employee_name, company_name)
+        emp_id, emp_name, comp_name, branch_name, branch_id, error = _resolve_employee(ctx, employee_name, company_name, employee_id)
         if error:
             return error
 

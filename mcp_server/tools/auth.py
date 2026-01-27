@@ -10,6 +10,7 @@ from ..auth import (
     get_user_context, SUPER_ADMIN_PHONE, normalize_phone,
     save_local_session_id, clear_local_session_id, get_local_session_id,
     set_request_session_id, get_request_session_id, clear_request_session_id,
+    set_api_user, get_api_user, clear_api_user,
     SESSION_DIR
 )
 from ..db import get_current_environment, set_current_environment
@@ -652,9 +653,9 @@ def register(mcp):
         # First, validate user exists in users table
         try:
             user_query = """
-                SELECT id, user_name, contact_number
+                SELECT id, user_name, contact_number, is_delete
                 FROM users
-                WHERE id = $1 AND (is_delete IS NULL OR is_delete = '0' OR is_delete = 0)
+                WHERE id = $1
             """
             user_row = fetch_one(user_query, [user_id])
             if not user_row:
@@ -723,38 +724,11 @@ def register(mcp):
         # Check if this is super admin (RBAC bypass)
         is_super_admin = SUPER_ADMIN_PHONE and phone_digits and phone_digits == normalize_phone(SUPER_ADMIN_PHONE)
 
-        # Create a request-scoped session in Supabase
-        session_id = f"req_{uuid.uuid4().hex[:16]}"
-
-        session_data = {
-            "phone": phone_digits,
-            "user_id": user_id,
-            "user_name": user_name,
-            "token": None,  # No token in API mode
-            "companies": companies_data,
-            "primary_company_id": primary_company_id,
-            "primary_branch_id": primary_branch_id,
-            "role_id": role_id,
-            "is_super_admin": is_super_admin,
-        }
-
-        # Create session in Supabase
-        session_store.create(
-            session_id=session_id,
-            phone=phone_digits,
-            environment=environment,
-            mode="api",  # Mark as API mode
-            is_authenticated=True,
-            otp_pending=False,
-            **session_data
-        )
-
-        # Set the request-scoped session ID so get_user_context() can find it
-        set_request_session_id(session_id)
+        # Set the API user directly (simpler approach - no Supabase session needed)
+        set_api_user(user_id, environment)
 
         return {
             "success": True,
-            "session_id": session_id,
             "user_id": user_id,
             "user_name": user_name,
             "environment": environment,
@@ -769,16 +743,16 @@ def register(mcp):
         """
         [INTERNAL - API use only, not exposed to agent]
         Clear the current request context. Called after request processing.
-        Deletes the temporary session from Supabase and clears local state.
         """
-        session_id = get_request_session_id()
+        # Clear the simpler API user context
+        api_user = get_api_user()
+        clear_api_user()
 
-        if session_id:
-            # Delete from Supabase
-            session_store.delete(session_id)
-            # Clear local request-scoped session
-            clear_request_session_id()
-            return {"success": True, "message": "Context cleared", "session_id": session_id}
+        # Also clear legacy session ID if any
+        clear_request_session_id()
+
+        if api_user:
+            return {"success": True, "message": "Context cleared", "user_id": api_user[0]}
 
         return {"success": True, "message": "No active context to clear"}
 

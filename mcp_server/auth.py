@@ -21,6 +21,12 @@ SESSION_FILE = os.path.join(SESSION_DIR, "session.txt")
 
 # Request-scoped session ID (API mode - set per request, cleared after)
 _current_request_session_id: Optional[str] = None
+# Flag to indicate we're in API mode (prevents fallback to CLI session)
+_in_api_mode: bool = False
+
+# Request-scoped user context (API mode - simpler approach)
+_current_api_user_id: Optional[int] = None
+_current_api_environment: Optional[str] = None
 
 
 def normalize_phone(phone: str) -> str:
@@ -144,25 +150,122 @@ def clear_local_session_id() -> None:
 
 
 def set_request_session_id(session_id: Optional[str]) -> None:
-    """Set the request-scoped session ID (API mode)."""
-    global _current_request_session_id
+    """Set the request-scoped session ID (API mode). DEPRECATED - use set_api_user instead."""
+    global _current_request_session_id, _in_api_mode
     _current_request_session_id = session_id
+    _in_api_mode = True
 
 
 def get_request_session_id() -> Optional[str]:
-    """Get the request-scoped session ID (API mode)."""
+    """Get the request-scoped session ID (API mode). DEPRECATED."""
     return _current_request_session_id
 
 
+def is_api_mode() -> bool:
+    """Check if we're currently processing an API request."""
+    return _in_api_mode or _current_api_user_id is not None
+
+
 def clear_request_session_id() -> None:
-    """Clear the request-scoped session ID (API mode)."""
-    global _current_request_session_id
+    """Clear the request-scoped session ID (API mode). DEPRECATED - use clear_api_user instead."""
+    global _current_request_session_id, _in_api_mode
     _current_request_session_id = None
+    _in_api_mode = False
+
+
+# Simpler API mode functions
+def set_api_user(user_id: int, environment: str = "prod") -> None:
+    """Set the current API user (simpler approach - no session store needed)."""
+    global _current_api_user_id, _current_api_environment
+    _current_api_user_id = user_id
+    _current_api_environment = environment
+
+
+def get_api_user() -> Optional[tuple]:
+    """Get current API user. Returns (user_id, environment) or None."""
+    if _current_api_user_id is not None:
+        return (_current_api_user_id, _current_api_environment or "prod")
+    return None
+
+
+def clear_api_user() -> None:
+    """Clear the current API user context."""
+    global _current_api_user_id, _current_api_environment
+    _current_api_user_id = None
+    _current_api_environment = None
 
 
 def get_session_from_supabase(session_id: str) -> Optional[dict]:
     """Fetch session from Supabase."""
     return session_store.get(session_id)
+
+
+def _build_user_context_from_db(user_id: int) -> Optional[UserContext]:
+    """Build UserContext directly from database (simpler API mode)."""
+    # First get user info
+    try:
+        user_query = """
+            SELECT id, user_name, contact_number
+            FROM users
+            WHERE id = $1
+        """
+        user_row = fetch_one(user_query, [user_id])
+        if not user_row:
+            return None
+
+        user_name = user_row.get("user_name", "Unknown")
+        phone = user_row.get("contact_number", "")
+    except Exception:
+        return None
+
+    # Query company_employee records with attendance counts
+    query = """
+        SELECT
+            ce.id as company_employee_id,
+            ce.company_id,
+            c.name as company_name,
+            ce.company_branch_id,
+            cb.name as branch_name,
+            ce.company_role_id as role_id,
+            ce.designation,
+            COALESCE(att.cnt, 0) as attendance_count
+        FROM company_employee ce
+        LEFT JOIN company c ON c.id = ce.company_id
+        LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+        LEFT JOIN (
+            SELECT company_employee_id, COUNT(*) as cnt
+            FROM company_attendance
+            GROUP BY company_employee_id
+        ) att ON att.company_employee_id = ce.id
+        WHERE ce.user_id = $1 AND ce.is_deleted = '0'
+        ORDER BY attendance_count DESC
+    """
+
+    try:
+        rows = fetch_all(query, [user_id])
+        companies = []
+
+        for i, row in enumerate(rows):
+            att_count = row.get("attendance_count") or 0
+            if isinstance(att_count, str):
+                att_count = int(att_count)
+
+            companies.append(CompanyContext(
+                company_employee_id=row["company_employee_id"],
+                company_id=row["company_id"],
+                company_name=row.get("company_name", "Unknown"),
+                company_branch_id=row.get("company_branch_id") or 0,
+                branch_name=row.get("branch_name", "Unknown"),
+                role_id=row.get("role_id") or 3,
+                designation=row.get("designation") or "",
+                attendance_count=att_count,
+                is_primary=(i == 0)
+            ))
+
+        return UserContext(user_id=user_id, user_name=user_name, phone=phone, companies=companies)
+
+    except Exception:
+        return UserContext(user_id=user_id, user_name=user_name, phone=phone, companies=[])
 
 
 def get_user_context(session_id: str = None) -> Optional[UserContext]:
@@ -171,18 +274,25 @@ def get_user_context(session_id: str = None) -> Optional[UserContext]:
     Primary company = most attendance records.
 
     Args:
-        session_id: Session ID to look up. If None, checks request-scoped session (API mode)
-                   then falls back to local file (CLI mode).
+        session_id: Session ID to look up. If None, checks API mode user first,
+                   then request-scoped session, then falls back to CLI session.
 
     Note: Even super admins get their company associations populated
     so that "my" queries (get_my_salary, etc.) know which companies to query.
     Super admin RBAC bypass happens in apply_company_filter, not here.
     """
-    # Get session_id from: parameter > request-scoped (API) > local file (CLI)
+    # Check for simpler API mode first (user_id set directly)
+    api_user = get_api_user()
+    if api_user:
+        user_id, environment = api_user
+        # Fetch user data directly from DB
+        return _build_user_context_from_db(user_id)
+
+    # Legacy flow: Get session_id from parameter > request-scoped (API) > local file (CLI)
     if not session_id:
-        session_id = get_request_session_id()  # API mode first
-    if not session_id:
-        session_id = get_local_session_id()  # CLI mode fallback
+        session_id = get_request_session_id()
+    if not session_id and not is_api_mode():
+        session_id = get_local_session_id()
 
     if not session_id:
         return None

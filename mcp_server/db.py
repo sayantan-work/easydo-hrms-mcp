@@ -10,7 +10,11 @@ load_dotenv()
 
 # Constants
 CREDENTIALS_FILE = os.path.expanduser("~/.easydo/credentials.json")
+SESSION_FILE = os.path.expanduser("~/.easydo/session.txt")
 DEFAULT_ENV = "prod"
+
+# In-memory environment override (set by login, used for API calls)
+_current_environment = None
 
 # Database mode: "direct" or "n8n"
 DB_MODE = os.getenv("DB_MODE", "n8n")
@@ -54,11 +58,41 @@ def _load_credentials() -> dict | None:
         return None
 
 
+def set_current_environment(env: str) -> None:
+    """Set the current environment (in-memory, for current session)."""
+    global _current_environment
+    _current_environment = env
+
+
 def get_current_environment() -> str:
-    """Get the current environment from credentials file."""
+    """Get the current environment. Priority: in-memory > session file > credentials > default."""
+    global _current_environment
+
+    # 1. Check in-memory override
+    if _current_environment:
+        return _current_environment
+
+    # 2. Check Supabase session via session file
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "r") as f:
+                session_id = f.read().strip()
+            if session_id:
+                # Import here to avoid circular imports
+                from .supabase_client import session_store
+                session = session_store.get(session_id)
+                if session:
+                    env = session.get("environment", DEFAULT_ENV)
+                    _current_environment = env  # Cache it
+                    return env
+        except Exception:
+            pass
+
+    # 3. Fallback to old credentials file (backward compatibility)
     creds = _load_credentials()
     if creds:
         return creds.get("environment", DEFAULT_ENV)
+
     return DEFAULT_ENV
 
 

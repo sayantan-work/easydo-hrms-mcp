@@ -1,25 +1,30 @@
 """Authentication tools for MCP server."""
 import json
 import os
+import uuid
 
 import requests
 from dotenv import load_dotenv
 
-from ..auth import get_user_context, SUPER_ADMIN_PHONE, normalize_phone
-from ..db import get_current_environment
+from ..auth import (
+    get_user_context, SUPER_ADMIN_PHONE, normalize_phone,
+    save_local_session_id, clear_local_session_id, get_local_session_id,
+    set_request_session_id, get_request_session_id, clear_request_session_id,
+    SESSION_DIR
+)
+from ..db import get_current_environment, set_current_environment
+from ..supabase_client import session_store
 
 load_dotenv()
 
 # Constants
-CREDENTIALS_DIR = os.path.expanduser("~/.easydo")
-CREDENTIALS_FILE = os.path.join(CREDENTIALS_DIR, "credentials.json")
-PENDING_LOGIN_FILE = os.path.join(CREDENTIALS_DIR, "pending_login.json")
+PENDING_LOGIN_FILE = os.path.join(SESSION_DIR, "pending_login.json")
 VALID_ENVIRONMENTS = ("prod", "staging")
 
 # Environment-specific API endpoints
 API_BASES = {
-    "prod": os.getenv("API_BASE_PROD"),
-    "staging": os.getenv("API_BASE_STAGING"),
+    "prod": os.getenv("API_BASE_PROD", "https://api-prod.easydoochat.com"),
+    "staging": os.getenv("API_BASE_STAGING", "https://api-staging.easydoochat.com"),
 }
 
 API_HEADERS = {
@@ -64,31 +69,34 @@ def format_phone_number(phone: str) -> tuple[str, str | None]:
     return phone, "Invalid phone number. Provide 10 digits or full number with country code (e.g., +9198XXXXXXXX)"
 
 
-def save_pending_login(environment: str, device_type: str) -> None:
+def save_pending_login(environment: str, device_type: str, session_id: str, phone: str) -> None:
     """Save pending login state to temp file."""
-    os.makedirs(CREDENTIALS_DIR, exist_ok=True)
+    os.makedirs(SESSION_DIR, exist_ok=True)
     with open(PENDING_LOGIN_FILE, "w") as f:
-        json.dump({"environment": environment, "device_type": device_type}, f)
+        json.dump({
+            "environment": environment,
+            "device_type": device_type,
+            "session_id": session_id,
+            "phone": phone
+        }, f)
 
 
-def load_pending_login() -> tuple[str, str]:
-    """Load pending login state. Returns (environment, device_type) with defaults."""
+def load_pending_login() -> dict:
+    """Load pending login state. Returns dict with defaults."""
     if not os.path.exists(PENDING_LOGIN_FILE):
-        return "prod", "ios"
+        return {"environment": "prod", "device_type": "ios", "session_id": None, "phone": None}
 
     try:
         with open(PENDING_LOGIN_FILE, "r") as f:
             pending = json.load(f)
-            return pending.get("environment", "prod"), pending.get("device_type", "ios")
+            return {
+                "environment": pending.get("environment", "prod"),
+                "device_type": pending.get("device_type", "ios"),
+                "session_id": pending.get("session_id"),
+                "phone": pending.get("phone")
+            }
     except (json.JSONDecodeError, IOError):
-        return "prod", "ios"
-
-
-def save_credentials(creds: dict) -> None:
-    """Save credentials to file."""
-    os.makedirs(CREDENTIALS_DIR, exist_ok=True)
-    with open(CREDENTIALS_FILE, "w") as f:
-        json.dump(creds, f, indent=2)
+        return {"environment": "prod", "device_type": "ios", "session_id": None, "phone": None}
 
 
 def cleanup_pending_login() -> None:
@@ -213,76 +221,73 @@ def register(mcp):
                 "hint": "Call login again with environment='prod' or environment='staging'",
             }
 
-        phone, error = format_phone_number(phone)
+        phone_formatted, error = format_phone_number(phone)
         if error:
             return {"error": error}
 
-        # Check if super admin - bypass OTP
-        if SUPER_ADMIN_PHONE and normalize_phone(phone) == normalize_phone(SUPER_ADMIN_PHONE):
-            # Temporarily set environment so DB queries work
-            save_credentials({"environment": environment})
+        phone_digits = normalize_phone(phone_formatted)
 
-            # Try to fetch actual user record from DB
-            from ..db import fetch_one
-            user_data = None
-            try:
-                # Phone stored as contact_number (without country code) or with +91 prefix
-                phone_digits = normalize_phone(phone)  # Last 10 digits
-                user_data = fetch_one(
-                    "SELECT id, user_name FROM users WHERE contact_number = $1 OR contact_number = $2 LIMIT 1",
-                    [phone_digits, phone]
-                )
-            except Exception:
-                pass  # DB lookup failed, use defaults
+        # Auto-logout previous user if any (CLI only supports one user at a time)
+        existing_local_session = get_local_session_id()
+        if existing_local_session:
+            session_store.delete(existing_local_session)  # Mark as inactive
+            clear_local_session_id()
 
-            creds = {
-                "user_id": user_data.get("id") if user_data else None,
-                "user_name": user_data.get("user_name", "Super Admin") if user_data else "Super Admin",
-                "phone": phone,
-                "token": None,
-                "token_expires_at": None,
-                "environment": environment,
-            }
-            save_credentials(creds)
-            cleanup_pending_login()
+        # Check if this is super admin phone (for messaging only, still needs OTP)
+        is_super_admin_phone = SUPER_ADMIN_PHONE and phone_digits == normalize_phone(SUPER_ADMIN_PHONE)
 
-            return {
-                "success": True,
-                "message": f"Super Admin login successful! Connected to {environment.upper()}. No OTP required.",
-                "user_id": creds["user_id"],
-                "user_name": creds["user_name"],
-                "environment": environment,
-                "is_super_admin": True,
-            }
+        # All users go through OTP flow (super admin included - they need token too)
+        # We'll create/reuse session after OTP verification since we don't have user_id yet
+        # Create a new pending session for OTP flow
+        session_id = f"sess_{uuid.uuid4().hex[:16]}"
 
-        save_pending_login(environment, device_type)
+        # Create pending session in Supabase
+        session_store.create(
+            session_id=session_id,
+            phone=phone_digits,
+            environment=environment,
+            mode="cli",
+            is_authenticated=False,
+            otp_pending=True
+        )
+
+        # Save pending login state locally
+        save_pending_login(environment, device_type, session_id, phone_formatted)
+
+        # Set environment for API URL
+        set_current_environment(environment)
 
         try:
             resp = requests.post(
                 get_api_url("/api/v2/user-otp-send"),
                 headers={**API_HEADERS, "device_type": device_type},
-                json={"fcm_token": "dgtewtwet", "phone_no": phone, "is_development": 1},
+                json={"fcm_token": "dgtewtwet", "phone_no": phone_formatted, "is_development": 1},
                 timeout=10,
             )
             data = resp.json()
         except Exception as e:
+            # Cleanup session on failure
+            session_store.delete(session_id)
             return {"error": f"Failed to send OTP: {str(e)}"}
 
         if not data.get("success"):
+            # Cleanup session on failure
+            session_store.delete(session_id)
             return {"error": data.get("message", "Failed to send OTP")}
 
         result = {
             "success": True,
-            "phone": phone,
+            "session_id": session_id,
+            "phone": phone_formatted,
             "environment": environment,
         }
 
         otp = data.get("otp")
         if otp:
-            result["message"] = f"OTP for {phone} is {otp}. Call verify_otp to complete login."
+            result["message"] = f"OTP for {phone_formatted} is {otp}. Call verify_otp to complete login."
             result["otp"] = otp
         else:
-            result["message"] = f"OTP sent to {phone}. Enter the OTP to complete login."
+            result["message"] = f"OTP sent to {phone_formatted}. Enter the OTP to complete login."
 
         return result
 
@@ -291,19 +296,26 @@ def register(mcp):
         """
         Verify OTP and complete login. Call this after login(phone) sends the OTP.
         """
-        phone, _ = format_phone_number(phone)
+        phone_formatted, _ = format_phone_number(phone)
         otp = otp.strip()
 
-        environment, device_type = load_pending_login()
+        # Load pending login state
+        pending = load_pending_login()
+        environment = pending["environment"]
+        device_type = pending["device_type"]
+        session_id = pending["session_id"]
 
-        # Temporarily set environment so get_api_url works correctly
-        save_credentials({"environment": environment})
+        if not session_id:
+            return {"error": "No pending login found. Please call login() first."}
+
+        # Set environment for API URL
+        set_current_environment(environment)
 
         try:
             resp = requests.post(
                 get_api_url("/api/v2/user-verify-otp"),
                 headers={**API_HEADERS, "device_type": device_type},
-                data={"phone_no": phone, "fcm_token": "dgtewtwet", "otp": otp},
+                json={"phone_no": phone_formatted, "fcm_token": "dgtewtwet", "otp": otp},
                 timeout=10,
             )
             data = resp.json()
@@ -314,33 +326,132 @@ def register(mcp):
             return {"error": data.get("message", "Invalid OTP")}
 
         user_data = data.get("data", {})
-        creds = {
-            "user_id": user_data.get("user_id"),
-            "user_name": user_data.get("user_name"),
-            "phone": phone,
+        user_id = user_data.get("user_id") or user_data.get("id")
+        user_name = user_data.get("user_name", "")
+
+        # Fetch company/RBAC data from HRMS DB
+        from ..db import fetch_all
+        companies_data = []
+        primary_company_id = None
+        primary_branch_id = None
+        role_id = None
+
+        try:
+            query = """
+                SELECT
+                    ce.id as company_employee_id,
+                    ce.company_id,
+                    c.name as company_name,
+                    ce.company_branch_id,
+                    cb.name as branch_name,
+                    ce.company_role_id as role_id,
+                    ce.designation,
+                    COALESCE(att.cnt, 0) as attendance_count
+                FROM company_employee ce
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN (
+                    SELECT company_employee_id, COUNT(*) as cnt
+                    FROM company_attendance
+                    GROUP BY company_employee_id
+                ) att ON att.company_employee_id = ce.id
+                WHERE ce.user_id = $1 AND ce.is_deleted = '0'
+                ORDER BY attendance_count DESC
+            """
+            rows = fetch_all(query, [user_id])
+
+            for i, row in enumerate(rows):
+                is_primary = (i == 0)  # First row has highest attendance
+                companies_data.append({
+                    "company_employee_id": row["company_employee_id"],
+                    "company_id": row["company_id"],
+                    "company_name": row.get("company_name", "Unknown"),
+                    "company_branch_id": row.get("company_branch_id"),
+                    "branch_name": row.get("branch_name", "Unknown"),
+                    "role_id": row.get("role_id") or 3,
+                    "designation": row.get("designation") or "",
+                    "is_primary": is_primary,
+                })
+                if is_primary:
+                    primary_company_id = row["company_id"]
+                    primary_branch_id = row.get("company_branch_id")
+                    role_id = row.get("role_id") or 3
+        except Exception as e:
+            print(f"[verify_otp] Failed to fetch companies: {e}")
+
+        phone_digits = normalize_phone(phone_formatted)
+
+        # Check if this is super admin (RBAC bypass, but still needs OTP for token)
+        is_super_admin = SUPER_ADMIN_PHONE and phone_digits == normalize_phone(SUPER_ADMIN_PHONE)
+
+        session_data = {
+            "phone": phone_digits,
+            "user_id": user_id,
+            "user_name": user_name,
             "token": user_data.get("token"),
-            "token_expires_at": user_data.get("token_expires_at"),
-            "environment": environment,
+            "companies": companies_data,
+            "primary_company_id": primary_company_id,
+            "primary_branch_id": primary_branch_id,
+            "role_id": role_id,
+            "is_super_admin": is_super_admin,
         }
 
-        save_credentials(creds)
+        # Check for existing session to reuse
+        existing_session = session_store.find_by_user_mode(user_id, "cli") if user_id else None
+        reused = False
+
+        if existing_session and existing_session["session_id"] != session_id:
+            # Found a different existing session - reactivate it
+            final_session_id = existing_session["session_id"]
+            session_store.reactivate(final_session_id, **session_data)
+            # Delete the pending session we created during login
+            session_store.delete(session_id)
+            reused = True
+        else:
+            # Use the pending session (either no existing or same session)
+            final_session_id = session_id
+            session_store.update(
+                session_id,
+                is_authenticated=True,
+                otp_pending=False,
+                **session_data
+            )
+
+        # Save session_id locally for CLI
+        save_local_session_id(final_session_id)
         cleanup_pending_login()
 
         return {
             "success": True,
-            "message": f"Login successful! Welcome {creds['user_name']}. Connected to {environment.upper()}.",
-            "user_id": creds["user_id"],
-            "user_name": creds["user_name"],
+            "message": f"Login successful! Welcome {user_name}. Connected to {environment.upper()}.",
+            "session_id": final_session_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "phone": phone_digits,
             "environment": environment,
+            "is_super_admin": is_super_admin,
+            "companies": companies_data,
+            "primary_company_id": primary_company_id,
+            "primary_branch_id": primary_branch_id,
+            "role_id": role_id,
+            "session_reused": reused,
         }
 
     @mcp.tool()
     def logout() -> dict:
         """Logout and clear saved credentials."""
-        if os.path.exists(CREDENTIALS_FILE):
-            os.remove(CREDENTIALS_FILE)
-            return {"success": True, "message": "Logged out successfully."}
-        return {"success": True, "message": "Already logged out."}
+        # Get current session_id from local file
+        session_id = get_local_session_id()
+
+        if session_id:
+            # Delete from Supabase
+            session_store.delete(session_id)
+
+        # Clear local session file
+        clear_local_session_id()
+        cleanup_pending_login()
+
+        return {"success": True, "message": "Logged out successfully."}
 
     @mcp.tool()
     def whoami() -> dict:
@@ -510,4 +621,164 @@ def register(mcp):
             "companies": companies_list,
             "environment": get_current_environment(),
         }
+
+    # =========================================================================
+    # INTERNAL TOOLS (API mode only - filtered from agent's tool list)
+    # =========================================================================
+
+    @mcp.tool()
+    def set_request_context(user_id: int, environment: str = "prod") -> dict:
+        """
+        [INTERNAL - API use only, not exposed to agent]
+        Set user context directly from user_id without OTP flow.
+        Used by API layer to authenticate requests with pre-validated user_id.
+
+        Args:
+            user_id: The user ID to set context for (must exist in HRMS DB)
+            environment: 'prod' or 'staging' - which database to use
+
+        Returns:
+            dict with success status and user info, or error if user not found
+        """
+        if environment not in VALID_ENVIRONMENTS:
+            return {"error": f"Invalid environment. Use one of: {VALID_ENVIRONMENTS}"}
+
+        # Set environment for DB queries
+        set_current_environment(environment)
+
+        # Import here to avoid circular imports
+        from ..db import fetch_all, fetch_one
+
+        # First, validate user exists in users table
+        try:
+            user_query = """
+                SELECT id, user_name, contact_number
+                FROM users
+                WHERE id = $1 AND (is_delete IS NULL OR is_delete = '0' OR is_delete = 0)
+            """
+            user_row = fetch_one(user_query, [user_id])
+            if not user_row:
+                return {"error": f"User with id {user_id} not found in {environment} database"}
+
+            user_name = user_row.get("user_name", "Unknown")
+            phone = user_row.get("contact_number", "")
+        except Exception as e:
+            return {"error": f"Failed to fetch user: {str(e)}"}
+
+        # Fetch company/RBAC data from HRMS DB (same query as verify_otp)
+        companies_data = []
+        primary_company_id = None
+        primary_branch_id = None
+        role_id = None
+
+        try:
+            query = """
+                SELECT
+                    ce.id as company_employee_id,
+                    ce.company_id,
+                    c.name as company_name,
+                    ce.company_branch_id,
+                    cb.name as branch_name,
+                    ce.company_role_id as role_id,
+                    ce.designation,
+                    COALESCE(att.cnt, 0) as attendance_count
+                FROM company_employee ce
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                LEFT JOIN (
+                    SELECT company_employee_id, COUNT(*) as cnt
+                    FROM company_attendance
+                    GROUP BY company_employee_id
+                ) att ON att.company_employee_id = ce.id
+                WHERE ce.user_id = $1 AND ce.is_deleted = '0'
+                ORDER BY attendance_count DESC
+            """
+            rows = fetch_all(query, [user_id])
+
+            for i, row in enumerate(rows):
+                is_primary = (i == 0)  # First row has highest attendance
+                companies_data.append({
+                    "company_employee_id": row["company_employee_id"],
+                    "company_id": row["company_id"],
+                    "company_name": row.get("company_name", "Unknown"),
+                    "company_branch_id": row.get("company_branch_id"),
+                    "branch_name": row.get("branch_name", "Unknown"),
+                    "role_id": row.get("role_id") or 3,
+                    "designation": row.get("designation") or "",
+                    "is_primary": is_primary,
+                })
+                if is_primary:
+                    primary_company_id = row["company_id"]
+                    primary_branch_id = row.get("company_branch_id")
+                    role_id = row.get("role_id") or 3
+        except Exception as e:
+            return {"error": f"Failed to fetch company data: {str(e)}"}
+
+        # Check if no company associations found
+        if not companies_data:
+            return {"error": f"User {user_id} has no active company associations"}
+
+        phone_digits = normalize_phone(phone) if phone else ""
+
+        # Check if this is super admin (RBAC bypass)
+        is_super_admin = SUPER_ADMIN_PHONE and phone_digits and phone_digits == normalize_phone(SUPER_ADMIN_PHONE)
+
+        # Create a request-scoped session in Supabase
+        session_id = f"req_{uuid.uuid4().hex[:16]}"
+
+        session_data = {
+            "phone": phone_digits,
+            "user_id": user_id,
+            "user_name": user_name,
+            "token": None,  # No token in API mode
+            "companies": companies_data,
+            "primary_company_id": primary_company_id,
+            "primary_branch_id": primary_branch_id,
+            "role_id": role_id,
+            "is_super_admin": is_super_admin,
+        }
+
+        # Create session in Supabase
+        session_store.create(
+            session_id=session_id,
+            phone=phone_digits,
+            environment=environment,
+            mode="api",  # Mark as API mode
+            is_authenticated=True,
+            otp_pending=False,
+            **session_data
+        )
+
+        # Set the request-scoped session ID so get_user_context() can find it
+        set_request_session_id(session_id)
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "environment": environment,
+            "is_super_admin": is_super_admin,
+            "companies": companies_data,
+            "primary_company_id": primary_company_id,
+            "role_id": role_id,
+        }
+
+    @mcp.tool()
+    def clear_context() -> dict:
+        """
+        [INTERNAL - API use only, not exposed to agent]
+        Clear the current request context. Called after request processing.
+        Deletes the temporary session from Supabase and clears local state.
+        """
+        session_id = get_request_session_id()
+
+        if session_id:
+            # Delete from Supabase
+            session_store.delete(session_id)
+            # Clear local request-scoped session
+            clear_request_session_id()
+            return {"success": True, "message": "Context cleared", "session_id": session_id}
+
+        return {"success": True, "message": "No active context to clear"}
 

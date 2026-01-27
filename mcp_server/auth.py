@@ -6,13 +6,21 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
-from .db import CREDENTIALS_FILE, fetch_all, fetch_one
+from .db import fetch_all, fetch_one
+from .supabase_client import session_store
 
 # Load environment variables
 load_dotenv()
 
 # Super admin phone number (bypasses all RBAC) - from .env
 SUPER_ADMIN_PHONE = os.getenv("SUPER_ADMIN_PHONE", "").strip()
+
+# Local session file (CLI mode only - stores just session_id)
+SESSION_DIR = os.path.expanduser("~/.easydo")
+SESSION_FILE = os.path.join(SESSION_DIR, "session.txt")
+
+# Request-scoped session ID (API mode - set per request, cleared after)
+_current_request_session_id: Optional[str] = None
 
 
 def normalize_phone(phone: str) -> str:
@@ -111,30 +119,85 @@ class UserContext:
         return self.primary_company.role_id == 3 if self.primary_company else True
 
 
-def load_credentials() -> Optional[dict]:
-    """Load credentials from ~/.easydo/credentials.json"""
-    if not os.path.exists(CREDENTIALS_FILE):
+def get_local_session_id() -> Optional[str]:
+    """Read session_id from local file (CLI mode)."""
+    if not os.path.exists(SESSION_FILE):
         return None
-    with open(CREDENTIALS_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(SESSION_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
 
 
-def get_user_context() -> Optional[UserContext]:
+def save_local_session_id(session_id: str) -> None:
+    """Save session_id to local file (CLI mode)."""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    with open(SESSION_FILE, "w") as f:
+        f.write(session_id)
+
+
+def clear_local_session_id() -> None:
+    """Clear local session file (logout)."""
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+
+
+def set_request_session_id(session_id: Optional[str]) -> None:
+    """Set the request-scoped session ID (API mode)."""
+    global _current_request_session_id
+    _current_request_session_id = session_id
+
+
+def get_request_session_id() -> Optional[str]:
+    """Get the request-scoped session ID (API mode)."""
+    return _current_request_session_id
+
+
+def clear_request_session_id() -> None:
+    """Clear the request-scoped session ID (API mode)."""
+    global _current_request_session_id
+    _current_request_session_id = None
+
+
+def get_session_from_supabase(session_id: str) -> Optional[dict]:
+    """Fetch session from Supabase."""
+    return session_store.get(session_id)
+
+
+def get_user_context(session_id: str = None) -> Optional[UserContext]:
     """
     Get user context with all companies and their roles.
     Primary company = most attendance records.
+
+    Args:
+        session_id: Session ID to look up. If None, checks request-scoped session (API mode)
+                   then falls back to local file (CLI mode).
 
     Note: Even super admins get their company associations populated
     so that "my" queries (get_my_salary, etc.) know which companies to query.
     Super admin RBAC bypass happens in apply_company_filter, not here.
     """
-    creds = load_credentials()
-    if not creds:
+    # Get session_id from: parameter > request-scoped (API) > local file (CLI)
+    if not session_id:
+        session_id = get_request_session_id()  # API mode first
+    if not session_id:
+        session_id = get_local_session_id()  # CLI mode fallback
+
+    if not session_id:
         return None
 
-    user_id = creds.get("user_id")
-    user_name = creds.get("user_name", "Unknown")
-    phone = creds.get("phone", "")
+    # Fetch session from Supabase
+    session = get_session_from_supabase(session_id)
+    if not session:
+        return None
+
+    if not session.get("is_authenticated"):
+        return None
+
+    user_id = session.get("user_id")
+    user_name = session.get("user_name", "Unknown")
+    phone = session.get("phone", "")
 
     # Check if super admin by phone (can work even without user_id in DB)
     is_super = SUPER_ADMIN_PHONE and phone and normalize_phone(phone) == normalize_phone(SUPER_ADMIN_PHONE)

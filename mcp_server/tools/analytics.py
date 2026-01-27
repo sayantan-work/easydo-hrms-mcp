@@ -363,35 +363,42 @@ def register(mcp):
 
         month = month or _get_default_month()
 
-        def parse_month(target_month: str) -> tuple:
-            """Parse YYYY-MM string into (year, month) tuple."""
-            try:
-                return tuple(map(int, target_month.split("-")))
-            except (ValueError, AttributeError):
-                now = datetime.now()
-                return now.year, now.month
-
         def get_attendance_for_month(target_month):
-            yr, mn = parse_month(target_month)
-
+            # Query company_attendance table directly
             base_query = """
                 SELECT
-                    COUNT(DISTINCT ams.company_employee_id) as employee_count,
-                    SUM(ams.working_days) as total_working_days,
-                    SUM(ams.present_days) as total_present_days,
-                    SUM(ams.absent_days) as total_absent_days,
-                    SUM(ams.late_days) as total_late_days,
-                    SUM(ams.half_days) as total_half_days,
-                    SUM(ams.leave_days) as total_leave_days,
-                    AVG(ams.attendance_percentage) as avg_attendance_pct
-                FROM attendance_monthly_summary ams
-                JOIN company_employee ce ON ce.id = ams.company_employee_id
+                    COUNT(DISTINCT ca.company_employee_id) as employee_count,
+                    COUNT(DISTINCT ca.date) as total_working_days,
+                    COUNT(*) as total_present_days,
+                    SUM(CASE WHEN ca.is_late = 1 THEN 1 ELSE 0 END) as total_late_days,
+                    SUM(CASE WHEN ca.is_half_day = 1 THEN 1 ELSE 0 END) as total_half_days
+                FROM company_attendance ca
+                JOIN company_employee ce ON ce.id = ca.company_employee_id
                 LEFT JOIN company c ON c.id = ce.company_id
                 LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-                WHERE ce.is_deleted = '0' AND ams.year = $1 AND ams.month = $2
+                WHERE ce.is_deleted = '0'
+                  AND ca.status = 'present'
+                  AND TO_CHAR(ca.date, 'YYYY-MM') = $1
             """
 
-            qb = QueryBuilder(base_query, [yr, mn])
+            qb = QueryBuilder(base_query, [target_month])
+            qb.add_company_filter(company_name)
+            qb.add_branch_filter(branch_name)
+            qb.apply_rbac(ctx, "ce")
+
+            return fetch_one(qb.query, qb.params)
+
+        def get_total_employees(target_month):
+            # Get total active employees for attendance percentage calculation
+            base_query = """
+                SELECT COUNT(DISTINCT ce.id) as total_employees
+                FROM company_employee ce
+                LEFT JOIN company c ON c.id = ce.company_id
+                LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
+                WHERE ce.is_deleted = '0' AND ce.employee_status = 3
+            """
+
+            qb = QueryBuilder(base_query)
             qb.add_company_filter(company_name)
             qb.add_branch_filter(branch_name)
             qb.apply_rbac(ctx, "ce")
@@ -399,27 +406,47 @@ def register(mcp):
             return fetch_one(qb.query, qb.params)
 
         current_data = get_attendance_for_month(month)
+        emp_data = get_total_employees(month)
+
+        employee_count = _safe_int(current_data.get("employee_count") if current_data else 0)
+        total_employees = _safe_int(emp_data.get("total_employees") if emp_data else 0)
+        present_days = _safe_float(current_data.get("total_present_days") if current_data else 0)
+        working_days = _safe_float(current_data.get("total_working_days") if current_data else 0)
+
+        # Calculate attendance percentage: (employees who attended / total employees) * 100
+        # Or based on present_days / (total_employees * working_days) if we want day-level accuracy
+        avg_pct = 0.0
+        if total_employees > 0 and working_days > 0:
+            # Average daily attendance rate
+            avg_pct = round((present_days / (total_employees * working_days)) * 100, 2)
 
         result = {
             "month": month,
             "summary": {
-                "employee_count": _safe_int(current_data.get("employee_count") if current_data else 0),
-                "total_working_days": _safe_float(current_data.get("total_working_days") if current_data else 0),
-                "total_present_days": _safe_float(current_data.get("total_present_days") if current_data else 0),
-                "total_absent_days": _safe_float(current_data.get("total_absent_days") if current_data else 0),
+                "employee_count": employee_count,
+                "total_employees": total_employees,
+                "total_working_days": working_days,
+                "total_present_days": present_days,
                 "total_late_days": _safe_float(current_data.get("total_late_days") if current_data else 0),
                 "total_half_days": _safe_float(current_data.get("total_half_days") if current_data else 0),
-                "total_leave_days": _safe_float(current_data.get("total_leave_days") if current_data else 0),
-                "avg_attendance_percentage": _round_float(current_data.get("avg_attendance_pct") if current_data else 0),
+                "avg_attendance_percentage": avg_pct,
             },
         }
 
         if compare:
             prev_month = _get_previous_month(month)
             prev_data = get_attendance_for_month(prev_month)
+            prev_emp_data = get_total_employees(prev_month)
+
+            prev_present = _safe_float(prev_data.get("total_present_days") if prev_data else 0)
+            prev_working = _safe_float(prev_data.get("total_working_days") if prev_data else 0)
+            prev_total_emp = _safe_int(prev_emp_data.get("total_employees") if prev_emp_data else 0)
+
+            prev_pct = 0.0
+            if prev_total_emp > 0 and prev_working > 0:
+                prev_pct = round((prev_present / (prev_total_emp * prev_working)) * 100, 2)
 
             curr_pct = result["summary"]["avg_attendance_percentage"]
-            prev_pct = _round_float(prev_data.get("avg_attendance_pct") if prev_data else 0)
             change_pct = round(curr_pct - prev_pct, 2)
 
             result["previous_month"] = {
@@ -452,20 +479,24 @@ def register(mcp):
 
         year = year or datetime.now().year
 
-        # Get leave taken from attendance_monthly_summary (aggregated by year)
+        # Get leave taken from company_approval (approved leaves only)
         taken_base = """
             SELECT
-                COUNT(DISTINCT ams.company_employee_id) as employee_count,
-                SUM(ams.sick_leaves_taken) as sick_leave_taken,
-                SUM(ams.casual_leaves_taken) as casual_leave_taken,
-                SUM(ams.earned_leaves_taken) as earned_leave_taken,
-                SUM(ams.other_leaves_taken) as other_leave_taken,
-                SUM(ams.leave_days) as total_leave_days
-            FROM attendance_monthly_summary ams
-            JOIN company_employee ce ON ce.id = ams.company_employee_id
+                COUNT(DISTINCT ca.company_employee_id) as employee_count,
+                SUM(CASE WHEN ca.leave_type IN ('sick_leave', 'sick') THEN ca.no_of_leave_day ELSE 0 END) as sick_leave_taken,
+                SUM(CASE WHEN ca.leave_type IN ('casual_leave', 'casual') THEN ca.no_of_leave_day ELSE 0 END) as casual_leave_taken,
+                SUM(CASE WHEN ca.leave_type IN ('earned_leave', 'earned', 'annual') THEN ca.no_of_leave_day ELSE 0 END) as earned_leave_taken,
+                SUM(CASE WHEN ca.leave_type = 'other_leave' THEN ca.no_of_leave_day ELSE 0 END) as other_leave_taken,
+                SUM(ca.no_of_leave_day) as total_leave_days
+            FROM company_approval ca
+            JOIN company_employee ce ON ce.id = ca.company_employee_id
             LEFT JOIN company c ON c.id = ce.company_id
             LEFT JOIN company_branch cb ON cb.id = ce.company_branch_id
-            WHERE ce.is_deleted = '0' AND ams.year = $1
+            WHERE ce.is_deleted = '0'
+              AND ca.status = 'APPROVED'
+              AND ca.leave_type IS NOT NULL
+              AND ca.leave_type != ''
+              AND EXTRACT(YEAR FROM ca.start_date) = $1
         """
 
         # Get current leave balances from company_employee_leave
@@ -492,7 +523,7 @@ def register(mcp):
         taken_data = fetch_one(taken_qb.query, taken_qb.params)
         balance_data = fetch_one(balance_qb.query, balance_qb.params)
 
-        if not taken_data:
+        if not taken_data and not balance_data:
             return {"error": "No leave data found"}
 
         def calc_utilization(taken: float, remaining: float) -> dict:

@@ -127,6 +127,66 @@ Create/update `~/.mcp.json` (home directory):
 
 ---
 
+## Remote Hosting (FastMCP)
+
+The server supports SSE transport for remote hosting. You can deploy to FastMCP Cloud or any container platform.
+
+### Run Locally with SSE
+
+```bash
+# Start server on port 8080 with SSE transport
+MCP_TRANSPORT=sse python -m mcp_server.server
+
+# Or with custom port
+MCP_TRANSPORT=sse MCP_PORT=3000 python -m mcp_server.server
+```
+
+Server will be available at `http://localhost:8080/sse`
+
+### Deploy to FastMCP Cloud
+
+1. Sign up at https://fastmcp.cloud
+2. Install FastMCP CLI: `pip install fastmcp`
+3. Deploy: `fastmcp deploy`
+
+### Deploy with Docker
+
+```bash
+# Build image
+docker build -t easydo-hrms-mcp .
+
+# Run container
+docker run -d -p 8080:8080 \
+  -e N8N_WEBHOOK_PROD=your_webhook \
+  -e N8N_WEBHOOK_STAGING=your_staging_webhook \
+  -e API_BASE_PROD=your_api \
+  -e API_BASE_STAGING=your_staging_api \
+  -e DEVICE_ID=your_device_id \
+  easydo-hrms-mcp
+```
+
+### Connect Claude Desktop to Remote Server
+
+Use `mcp-remote` to connect local Claude to remote MCP:
+
+```bash
+pip install mcp-remote
+```
+
+Add to Claude Desktop config:
+```json
+{
+  "mcpServers": {
+    "easydo-hrms-remote": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://your-server.com/sse"]
+    }
+  }
+}
+```
+
+---
+
 ## Troubleshooting
 
 | Issue | Solution |

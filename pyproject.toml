@@ -8,11 +8,12 @@ version = "1.0.0"
 description = "MCP Server for EasyDo HRMS - Natural language queries for HR data"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    "fastmcp>=2.0.0",
     "requests>=2.28.0",
     "python-dotenv>=1.0.0",
     "rapidfuzz>=3.0.0",
     "supabase>=2.0.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +23,8 @@ direct = [
 ]
 
 [project.scripts]
-easydo-hrms = "mcp_server.server:mcp.run"
+easydo-hrms = "mcp_server.server:run_stdio"
+easydo-hrms-sse = "mcp_server.server:run_sse"
 
 [tool.setuptools.packages.find]
 where = ["."]

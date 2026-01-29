@@ -20,7 +20,7 @@ TIMEZONE_OFFSETS = {
 WEEKDAY_MAP = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
 DAY_ABBR_MAP = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6}
 DAY_ABBR_REVERSE = {0: 'mon', 1: 'tue', 2: 'wed', 3: 'thu', 4: 'fri', 5: 'sat', 6: 'sun'}
-DEFAULT_WORKING_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri
+DEFAULT_WORKING_DAYS = {0, 1, 2, 3, 4, 5}  # Mon-Sat
 
 
 def _require_auth():
